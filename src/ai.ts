@@ -26,6 +26,7 @@ export function useAiConfig(): AiConfigPublic | null {
       return () => configListeners.delete(cb);
     },
     () => cachedConfig,
+    () => cachedConfig,
   );
 }
 
@@ -309,4 +310,34 @@ export async function fillRowWithAi(row: PageMeta, dbPage: PageMeta, def: Proper
   const result = (await streamAiChat({ messages: [{ role: "user", content }], temperature: 0.4 })).trim();
   if (result) setProp(row, def.id, result);
   return result;
+}
+
+/** AI 智能打标签：根据页面标题、正文内容及工作区已有标签池生成 2~4 个简短分类标签 */
+export async function suggestPageTags(
+  title: string,
+  bodyText: string,
+  workspaceTags: string[],
+): Promise<string[]> {
+  const poolHint = workspaceTags.length > 0 ? `\n工作区已有标签参考（优先复用契合的标签）：${workspaceTags.slice(0, 30).join("、")}` : "";
+  const prompt = [
+    `页面标题：${title || "无标题"}`,
+    `正文摘要：\n${bodyText.slice(0, 2400)}`,
+    poolHint,
+    "\n请为这篇笔记提炼 2 到 4 个简短精准的分类标签（每个标签 2~8 个字，不带 # 号）。只输出以英文逗号分隔的标签列表，不要任何解释。",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const raw = await streamAiChat({
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.3,
+  });
+  return Array.from(
+    new Set(
+      raw
+        .split(/[,，、\n]+/)
+        .map((s) => s.trim().replace(/^[#\-*\d.\s]+|["'。；;]+$/g, ""))
+        .filter((s) => s.length >= 1 && s.length <= 20),
+    ),
+  ).slice(0, 5);
 }

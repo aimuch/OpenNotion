@@ -27,7 +27,10 @@ function useLinkedViewsJson(key: string, initial: string): string {
       set.add(cb);
       return () => {
         set?.delete(cb);
-        if (set && set.size === 0) linkedViewsSubs.delete(key);
+        if (set && set.size === 0) {
+          linkedViewsSubs.delete(key);
+          linkedViewsCache.delete(key);
+        }
       };
     },
     () => linkedViewsCache.get(key) ?? initial,

@@ -3,6 +3,7 @@ import {
   Check,
   Cloud,
   Copy,
+  Download,
   Eraser,
   Eye,
   EyeOff,
@@ -10,10 +11,12 @@ import {
   FolderOpen,
   FolderSync,
   Import,
+  KeyRound,
   LoaderCircle,
   Monitor,
   Moon,
   Palette,
+  Plug,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -33,6 +36,7 @@ import type {
   AiProviderPublic,
   AiProviderUpdate,
   AiRegion,
+  McpConfigPublic,
   StorageInfo,
 } from "../../shared/types";
 import { fetchRemoteModels, loadAiConfig, saveAiConfig, testAiProvider } from "../ai";
@@ -46,12 +50,14 @@ import {
   desktopPickDataDir,
   desktopResetDataDir,
   emptyTrash,
+  fetchMcpConfig,
   fetchStorageInfo,
   navigate,
   openSettings,
   restorePage,
   setTheme,
   syncFromDisk,
+  updateMcpConfig,
   useStore,
   useTree,
   type ThemeSetting,
@@ -161,6 +167,14 @@ export function AiSettingsModal({
             </button>
             <button
               type="button"
+              className={cx("settings-nav-item", activeTab === "mcp" && "active")}
+              onClick={() => setTab("mcp")}
+            >
+              <Plug size={15} />
+              <span>MCP 与开放接口</span>
+            </button>
+            <button
+              type="button"
               className={cx("settings-nav-item", activeTab === "trash" && "active")}
               onClick={() => setTab("trash")}
             >
@@ -181,6 +195,7 @@ export function AiSettingsModal({
             />
           )}
           {activeTab === "ai" && <AiProvidersPane onClose={onClose} />}
+          {activeTab === "mcp" && <McpSettingsPane onClose={onClose} />}
           {activeTab === "trash" && <TrashPane items={tree.trash} onClose={onClose} />}
         </div>
       </div>
@@ -210,8 +225,9 @@ function AppearancePane({ theme, onClose }: { theme: ThemeSetting; onClose: () =
   ];
 
   const shortcuts: [string, string][] = [
-    [`${modKey}K / ${modKey}P`, "全局搜索页面标题与正文"],
+    [`${modKey}K / ${modKey}P`, "全局搜索页面标题、正文与 #标签"],
     [`${modKey}J`, "打开 AI 助手与全工作区问答"],
+    [`${modKey}⇧C`, "打开网页深度剪藏器（Web Clipper）"],
     [`${modKey},`, "打开工作区设置"],
     [`${modKey}\\`, "收起或展开左侧边栏"],
     ["/", "在编辑器插入扩展块或唤起内联 AI"],
@@ -407,11 +423,20 @@ function SyncAndDataPane({
         </section>
 
         <section className="settings-section">
-          <h3>导入与维护</h3>
+          <h3>备份、导入与维护</h3>
           <div className="settings-card-row">
             <div>
-              <strong>导入 Notion 导出包</strong>
-              <p>选择从 Notion 导出的 Markdown &amp; CSV（.zip）压缩包，自动还原页面树、数据库与附件。</p>
+              <strong>导出全量工作区备份（.zip）</strong>
+              <p>生成双轨压缩包：解压后 notes/ 目录保留纯文本 Markdown 树与附件供自由阅读，同时附带结构化元数据支持 100% 无损还原。</p>
+            </div>
+            <a className="ghost-btn small" href="/api/backup/export" download>
+              <Download size={14} /> 导出备份 .zip
+            </a>
+          </div>
+          <div className="settings-card-row">
+            <div>
+              <strong>导入备份 / Obsidian / Notion 导出包</strong>
+              <p>支持无损恢复 OpenNotion 备份包，或直接导入 Obsidian / Markdown 笔记库（自动转换双链与标签）及 Notion 导出包。</p>
             </div>
             <button
               type="button"
@@ -442,6 +467,175 @@ function SyncAndDataPane({
             {notice.text}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function McpSettingsPane({ onClose }: { onClose: () => void }) {
+  const [cfg, setCfg] = useState<McpConfigPublic | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    fetchMcpConfig().then(
+      (c) => alive && setCfg(c),
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const copyText = (key: string, val: string) => {
+    void navigator.clipboard?.writeText(val);
+    setCopiedKey(key);
+    window.setTimeout(() => setCopiedKey(null), 1800);
+  };
+
+  const patch = async (next: { enabled?: boolean; requireToken?: boolean; rotateToken?: boolean }) => {
+    setBusy(true);
+    try {
+      setCfg(await updateMcpConfig(next));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stdioParts = (cfg?.stdioCommand ?? "node server/mcp-stdio.ts").split(" ");
+  const stdioSnippet = JSON.stringify(
+    {
+      mcpServers: {
+        opennotion: {
+          command: stdioParts[0],
+          args: stdioParts.slice(1),
+        },
+      },
+    },
+    null,
+    2,
+  );
+
+  const httpSnippet = JSON.stringify(
+    {
+      mcpServers: {
+        opennotion: {
+          url: cfg?.endpoint ?? `${window.location.origin}/api/mcp`,
+          ...(cfg?.requireToken && cfg.token
+            ? { headers: { Authorization: `Bearer ${cfg.token}` } }
+            : {}),
+        },
+      },
+    },
+    null,
+    2,
+  );
+
+  return (
+    <div className="settings-pane">
+      <PaneHeader
+        title="MCP 与开放接口"
+        subtitle="通过原生 Model Context Protocol 让 Claude Code、Cursor、Windsurf 等外部 AI Agent 直接检索、写入与管理本地知识库。"
+        onClose={onClose}
+      />
+      <div className="settings-pane-body">
+        <section className="settings-section">
+          <h3>服务状态与安全口令</h3>
+          <div className="settings-card-row">
+            <div>
+              <strong>启用本地 MCP 服务（/api/mcp）</strong>
+              <p>开启后，本机运行的 AI 编程工具或桌面客户端可通过标准 JSON-RPC 2.0 协议读写页面与多维数据库。</p>
+            </div>
+            <label className="auto-toggle-row">
+              <input
+                type="checkbox"
+                checked={cfg?.enabled ?? true}
+                disabled={busy}
+                onChange={(e) => void patch({ enabled: e.target.checked })}
+              />
+              <span>{cfg?.enabled ? "已开启" : "已停用"}</span>
+            </label>
+          </div>
+
+          <div className="settings-card-row">
+            <div>
+              <strong>要求 Bearer Token 鉴权</strong>
+              <p>对同机 HTTP 请求额外校验口令（跨站书签剪藏始终强制校验此口令）。</p>
+            </div>
+            <label className="auto-toggle-row">
+              <input
+                type="checkbox"
+                checked={cfg?.requireToken ?? false}
+                disabled={busy}
+                onChange={(e) => void patch({ requireToken: e.target.checked })}
+              />
+              <span>{cfg?.requireToken ? "强制校验" : "本机免密"}</span>
+            </label>
+          </div>
+
+          <div className="mcp-copy-bar">
+            <KeyRound size={14} />
+            <input readOnly value={cfg?.token ?? "加载中…"} aria-label="安全口令" />
+            <button
+              type="button"
+              className="ghost-btn small"
+              disabled={!cfg}
+              onClick={() => cfg && copyText("token", cfg.token)}
+            >
+              {copiedKey === "token" ? <Check size={13} /> : <Copy size={13} />}
+              {copiedKey === "token" ? "已复制" : "复制口令"}
+            </button>
+            <button
+              type="button"
+              className="text-btn small"
+              disabled={busy}
+              onClick={() => void patch({ rotateToken: true })}
+            >
+              <RefreshCw size={13} /> 重置
+            </button>
+          </div>
+        </section>
+
+        <section className="settings-section">
+          <div className="mcp-code-head">
+            <h3>方式一：Streamable HTTP 接入（应用运行时即连即用）</h3>
+            <button
+              type="button"
+              className="ghost-btn small"
+              onClick={() => copyText("http", httpSnippet)}
+            >
+              {copiedKey === "http" ? <Check size={13} /> : <Copy size={13} />}
+              {copiedKey === "http" ? "已复制配置" : "复制 JSON"}
+            </button>
+          </div>
+          <pre className="mcp-code-box">{httpSnippet}</pre>
+
+          <div className="mcp-code-head" style={{ marginTop: 14 }}>
+            <h3>方式二：Stdio 独立进程接入（无需提前打开界面）</h3>
+            <button
+              type="button"
+              className="ghost-btn small"
+              onClick={() => copyText("stdio", stdioSnippet)}
+            >
+              {copiedKey === "stdio" ? <Check size={13} /> : <Copy size={13} />}
+              {copiedKey === "stdio" ? "已复制配置" : "复制 JSON"}
+            </button>
+          </div>
+          <pre className="mcp-code-box">{stdioSnippet}</pre>
+        </section>
+
+        <section className="settings-section">
+          <h3>内置 MCP 工具清单（{cfg?.tools.length ?? 7} 项）</h3>
+          <div className="shortcut-list">
+            {(cfg?.tools ?? []).map((t) => (
+              <div key={t.name} className="shortcut-row">
+                <code>{t.name}</code>
+                <span>{t.description}</span>
+              </div>
+            ))}
+          </div>
+        </section>
       </div>
     </div>
   );

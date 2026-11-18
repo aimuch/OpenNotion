@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownLeft,
   CalendarDays,
@@ -15,26 +15,34 @@ import {
   Lock,
   MessageSquare,
   PanelLeft,
+  Plus,
   RotateCcw,
+  Share2,
   Smile,
   Sparkles,
   Star,
   Table2,
+  Tag,
   Trash2,
   Undo2,
+  X,
 } from "lucide-react";
 import type { PageMeta, SearchHit } from "../../shared/types";
-import { blocksPlainText } from "../ai";
-import { transitionPageLoad, useMachine } from "../machines";
+import { blocksPlainText, suggestPageTags } from "../ai";
+import { transitionCover, transitionPageLoad, useMachine } from "../machines";
 import {
   ancestorsOf,
   applyTemplate,
   buildTree,
+  closePageModal,
   deletePage,
   fetchBacklinks,
   fetchPage,
   getState,
   navigate,
+  openHistoryModal,
+  openPosterModal,
+  reportError,
   restorePage,
   retryFailedSaves,
   setAiOpen,
@@ -46,6 +54,7 @@ import { BUILTIN_TEMPLATES } from "../templates";
 import { CommentsBox } from "./CommentsBox";
 import { HistoryModal } from "./HistoryModal";
 import { MenuItem, Popover, cx } from "./Popover";
+import { PosterModal } from "./PosterModal";
 import { defaultDatabase, exportCsv } from "../db";
 import { DatabaseView, RowProperties } from "./database/DatabaseView";
 import { Editor, type NoteEditor } from "./Editor";
@@ -81,12 +90,20 @@ function extractOutline(blocks: unknown[], out: OutlineItem[] = []): OutlineItem
 export function PageView({ id }: { id: string }) {
   const meta = useStore((s) => s.pages[id]);
   const parent = useStore((s) => (meta?.parentId ? s.pages[meta.parentId] : undefined));
+  const pageModal = useStore((s) => s.overlay.pageModal ?? "none");
   const [loadState, sendLoad] = useMachine(transitionPageLoad, { status: "loading" });
   const [reloadKey, setReloadKey] = useState(0);
-  const onDirty = useCallback(() => sendLoad({ type: "MARK_DIRTY" }), [sendLoad]);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [docTick, setDocTick] = useState(0);
+  const onDirty = useCallback(() => {
+    sendLoad({ type: "MARK_DIRTY" });
+    setDocTick((n) => n + 1);
+  }, [sendLoad]);
+  const historyOpen = pageModal === "history";
+  const posterOpen = pageModal === "poster";
   const [templateAnchor, setTemplateAnchor] = useState<HTMLElement | null>(null);
   const [commentOpen, setCommentOpen] = useState(false);
+  const [pendingQuote, setPendingQuote] = useState<string | null>(null);
+  const [tagInputOpen, setTagInputOpen] = useState(false);
   const [aiTrigger, setAiTrigger] = useState(0);
   const [backlinks, setBacklinks] = useState<SearchHit[]>([]);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
@@ -129,8 +146,15 @@ export function PageView({ id }: { id: string }) {
   const blank = !isDatabase && !isRow && editable && !dirty && record?.content.length === 0;
 
   const currentDoc = editorRef.current?.document ?? record?.content ?? [];
-  const wordCount = isDatabase ? undefined : blocksPlainText(currentDoc).replace(/\s+/g, "").length;
-  const outline = isDatabase ? [] : extractOutline(currentDoc);
+  const { wordCount, outline } = useMemo(() => {
+    if (isDatabase) return { wordCount: undefined, outline: [] as OutlineItem[] };
+    const doc = editorRef.current?.document ?? record?.content ?? [];
+    return {
+      wordCount: blocksPlainText(doc).replace(/\s+/g, "").length,
+      outline: extractOutline(doc),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDatabase, record, docTick]);
 
   const downloadBlob = (blob: Blob, ext: string) => {
     const a = document.createElement("a");
@@ -188,7 +212,8 @@ ${bodyHtml}
         onExport={exportPrimary}
         exportLabel={isDatabase ? "导出为 CSV" : "导出为 Markdown"}
         onExportHtml={isDatabase ? undefined : () => void exportHtml()}
-        onHistory={isDatabase ? undefined : () => setHistoryOpen(true)}
+        onPoster={isDatabase ? undefined : openPosterModal}
+        onHistory={isDatabase ? undefined : openHistoryModal}
         wordCount={wordCount}
       />
       {meta.trashed && <TrashBanner page={meta} />}
@@ -209,13 +234,27 @@ ${bodyHtml}
             editable={editable}
             onEnter={() => editorRef.current?.focus()}
             onAddComment={() => setCommentOpen(true)}
+            onAddTag={() => setTagInputOpen(true)}
+          />
+          <PageTagsBar
+            page={meta}
+            editable={editable}
+            adding={tagInputOpen}
+            onCloseAdding={() => setTagInputOpen(false)}
+            getBodyText={() => blocksPlainText(currentDoc)}
           />
           {isRow && parent && (
             <div inert={!editable}>
               <RowProperties row={meta} dbPage={parent} />
             </div>
           )}
-          <CommentsBox page={meta} openComposer={commentOpen} onCloseComposer={() => setCommentOpen(false)} />
+          <CommentsBox
+            page={meta}
+            openComposer={commentOpen}
+            pendingQuote={pendingQuote}
+            onClearQuote={() => setPendingQuote(null)}
+            onCloseComposer={() => setCommentOpen(false)}
+          />
           {backlinks.length > 0 && (
             <div className="backlinks-bar">
               <button
@@ -251,7 +290,12 @@ ${bodyHtml}
                 editable={editable}
                 onReady={onReady}
                 onDirty={onDirty}
+                onContentSync={() => setDocTick((n) => n + 1)}
                 aiTrigger={aiTrigger}
+                onQuoteComment={(q) => {
+                  setPendingQuote(q);
+                  setCommentOpen(true);
+                }}
               />
               {blank && (
                 <div className="starters">
@@ -294,7 +338,15 @@ ${bodyHtml}
         </div>
         {outline.length >= 2 && <FloatingOutline items={outline} />}
       </div>
-      {historyOpen && <HistoryModal page={meta} onClose={() => setHistoryOpen(false)} />}
+      {historyOpen && <HistoryModal page={meta} onClose={closePageModal} />}
+      {posterOpen && !isDatabase && (
+        <PosterModal
+          page={meta}
+          blocks={currentDoc}
+          wordCount={wordCount ?? 0}
+          onClose={closePageModal}
+        />
+      )}
       {templateAnchor && (
         <Popover anchor={templateAnchor} onClose={() => setTemplateAnchor(null)} className="menu template-menu">
           <div className="menu-title">内置模板</div>
@@ -366,11 +418,12 @@ interface TopbarProps {
   onExport: () => void;
   exportLabel: string;
   onExportHtml?: () => void;
+  onPoster?: () => void;
   onHistory?: () => void;
   wordCount?: number;
 }
 
-function Topbar({ page, onExport, exportLabel, onExportHtml, onHistory, wordCount }: TopbarProps) {
+function Topbar({ page, onExport, exportLabel, onExportHtml, onPoster, onHistory, wordCount }: TopbarProps) {
   const pages = useStore((s) => s.pages);
   const saveSummary = useStore((s) => s.saveSummary);
   const collapsed = useStore((s) => s.sidebarCollapsed);
@@ -441,6 +494,17 @@ function Topbar({ page, onExport, exportLabel, onExportHtml, onHistory, wordCoun
         )}
         {!page.trashed && (
           <>
+            {onPoster && (
+              <button
+                type="button"
+                className="icon-btn"
+                title="生成分享海报 / 打印 PDF"
+                aria-label="生成分享海报"
+                onClick={onPoster}
+              >
+                <Share2 size={16} />
+              </button>
+            )}
             <button
               type="button"
               className="icon-btn"
@@ -482,6 +546,7 @@ function Topbar({ page, onExport, exportLabel, onExportHtml, onHistory, wordCoun
           onExport={onExport}
           exportLabel={exportLabel}
           onExportHtml={onExportHtml}
+          onPoster={onPoster}
           onHistory={onHistory}
           wordCount={wordCount}
           onClose={() => setMenuAnchor(null)}
@@ -513,28 +578,42 @@ function TrashBanner({ page }: { page: PageMeta }) {
 }
 
 function Cover({ page, editable }: { page: PageMeta; editable: boolean }) {
-  const [anchor, setAnchor] = useState<HTMLElement | null>(null);
-  const [repositioning, setRepositioning] = useState(false);
-  const [dragY, setDragY] = useState<number>(page.coverY ?? 50);
+  const [coverState, sendCover] = useMachine(transitionCover, { mode: "viewing" });
 
   const isUploadedImg = Boolean(page.cover?.startsWith("/uploads/"));
-  const activeY = repositioning ? dragY : (page.coverY ?? 50);
+  const repositioning = coverState.mode === "repositioning";
+  const activeY = repositioning ? coverState.draftY : (page.coverY ?? 50);
+
+  useEffect(() => {
+    if (!repositioning) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        e.preventDefault();
+        sendCover({ type: "FINISH_REPOSITION" });
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [repositioning, sendCover]);
 
   const startDragCover = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!repositioning) return;
+    if (coverState.mode !== "repositioning") return;
     e.preventDefault();
     const startClientY = e.clientY;
-    const startVal = dragY;
+    const startVal = coverState.draftY;
     const rectH = e.currentTarget.getBoundingClientRect().height || 200;
     const el = e.currentTarget;
     el.setPointerCapture(e.pointerId);
+    sendCover({ type: "DRAG_START" });
     const onMove = (ev: PointerEvent) => {
       const delta = ((startClientY - ev.clientY) / rectH) * 100;
-      setDragY(Math.max(0, Math.min(100, Math.round(startVal + delta))));
+      sendCover({ type: "DRAG_MOVE", y: startVal + delta });
     };
     const onUp = () => {
       el.removeEventListener("pointermove", onMove);
       el.removeEventListener("pointerup", onUp);
+      sendCover({ type: "DRAG_END" });
     };
     el.addEventListener("pointermove", onMove);
     el.addEventListener("pointerup", onUp);
@@ -542,32 +621,30 @@ function Cover({ page, editable }: { page: PageMeta; editable: boolean }) {
 
   return (
     <div
-      className={cx("cover", anchor && "picking", repositioning && "repositioning")}
+      className={cx("cover", coverState.mode === "picking" && "picking", repositioning && "repositioning")}
+      data-cover-state={coverState.mode}
       style={coverStyle(page.cover!, activeY)}
       onPointerDown={startDragCover}
     >
       {repositioning && (
-        <div className="cover-reposition-tip">上下拖动图片调整显示焦点</div>
+        <div className="cover-reposition-tip">上下拖动图片调整显示焦点（Esc 取消）</div>
       )}
       {editable && (
         <div className={cx("cover-actions", repositioning && "visible")} onPointerDown={(e) => e.stopPropagation()}>
-          {repositioning ? (
+          {coverState.mode === "repositioning" ? (
             <>
               <button
                 type="button"
                 onClick={() => {
-                  updatePage(page.id, { coverY: dragY });
-                  setRepositioning(false);
+                  updatePage(page.id, { coverY: coverState.draftY });
+                  sendCover({ type: "FINISH_REPOSITION" });
                 }}
               >
                 保存位置
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setDragY(page.coverY ?? 50);
-                  setRepositioning(false);
-                }}
+                onClick={() => sendCover({ type: "FINISH_REPOSITION" })}
               >
                 取消
               </button>
@@ -577,26 +654,23 @@ function Cover({ page, editable }: { page: PageMeta; editable: boolean }) {
               {isUploadedImg && (
                 <button
                   type="button"
-                  onClick={() => {
-                    setDragY(page.coverY ?? 50);
-                    setRepositioning(true);
-                  }}
+                  onClick={() => sendCover({ type: "START_REPOSITION", initialY: page.coverY ?? 50 })}
                 >
                   调整位置
                 </button>
               )}
-              <button type="button" onClick={(e) => setAnchor(anchor ? null : e.currentTarget)}>
+              <button type="button" onClick={(e) => sendCover({ type: "TOGGLE_PICKER", anchor: e.currentTarget })}>
                 更换封面
               </button>
             </>
           )}
         </div>
       )}
-      {anchor && (
+      {coverState.mode === "picking" && (
         <CoverPicker
-          anchor={anchor}
+          anchor={coverState.anchor}
           onPick={(cover) => updatePage(page.id, { cover, coverY: 50 })}
-          onClose={() => setAnchor(null)}
+          onClose={() => sendCover({ type: "CLOSE_PICKER" })}
         />
       )}
     </div>
@@ -608,11 +682,13 @@ function PageHeader({
   editable,
   onEnter,
   onAddComment,
+  onAddTag,
 }: {
   page: PageMeta;
   editable: boolean;
   onEnter: () => void;
   onAddComment: () => void;
+  onAddTag: () => void;
 }) {
   const [emojiAnchor, setEmojiAnchor] = useState<HTMLElement | null>(null);
   const titleRef = useRef<HTMLTextAreaElement>(null);
@@ -665,6 +741,11 @@ function PageHeader({
               <ImageIcon size={15} /> 添加封面
             </button>
           )}
+          {(page.tags ?? []).length === 0 && (
+            <button type="button" onClick={onAddTag}>
+              <Tag size={15} /> 添加标签
+            </button>
+          )}
           {(page.comments ?? []).length === 0 && (
             <button type="button" onClick={onAddComment}>
               <MessageSquare size={15} /> 添加批注
@@ -697,6 +778,143 @@ function PageHeader({
           onPick={(icon) => updatePage(page.id, { icon })}
           onClose={() => setEmojiAnchor(null)}
         />
+      )}
+    </div>
+  );
+}
+
+function PageTagsBar({
+  page,
+  editable,
+  adding,
+  onCloseAdding,
+  getBodyText,
+}: {
+  page: PageMeta;
+  editable: boolean;
+  adding: boolean;
+  onCloseAdding: () => void;
+  getBodyText: () => string;
+}) {
+  const allPages = useStore((s) => s.pages);
+  const tags = page.tags ?? [];
+  const [draft, setDraft] = useState("");
+  const [inputOpen, setInputOpen] = useState(adding);
+  const [aiTagging, setAiTagging] = useState(false);
+
+  useEffect(() => {
+    if (adding) setInputOpen(true);
+  }, [adding]);
+
+  if (tags.length === 0 && !inputOpen) return null;
+
+  const workspaceTags = Array.from(
+    new Set(
+      Object.values(allPages)
+        .filter((p) => !p.trashed && !p.hidden)
+        .flatMap((p) => p.tags ?? []),
+    ),
+  );
+
+  const addTag = (raw: string) => {
+    const clean = raw.trim().replace(/^#+/, "").slice(0, 32);
+    if (!clean) return;
+    if (!tags.includes(clean)) {
+      updatePage(page.id, { tags: [...tags, clean] });
+    }
+    setDraft("");
+  };
+
+  const removeTag = (target: string) => {
+    updatePage(page.id, { tags: tags.filter((t) => t !== target) });
+  };
+
+  const runAiTagging = async () => {
+    if (aiTagging) return;
+    setAiTagging(true);
+    try {
+      const suggested = await suggestPageTags(page.title, getBodyText(), workspaceTags);
+      if (suggested.length > 0) {
+        updatePage(page.id, { tags: Array.from(new Set([...tags, ...suggested])).slice(0, 12) });
+      }
+    } catch (err) {
+      reportError(err instanceof Error ? err.message : "AI 自动打标失败，请检查模型配置");
+    } finally {
+      setAiTagging(false);
+    }
+  };
+
+  return (
+    <div className="page-tags-bar" aria-label="页面标签">
+      {tags.map((tag) => (
+        <span key={tag} className="page-tag-pill">
+          <span className="page-tag-hash">#</span>
+          <span>{tag}</span>
+          {editable && (
+            <button
+              type="button"
+              className="page-tag-remove"
+              aria-label={`移除标签 ${tag}`}
+              onClick={() => removeTag(tag)}
+            >
+              <X size={11} />
+            </button>
+          )}
+        </span>
+      ))}
+
+      {editable && inputOpen ? (
+        <div className="page-tag-input-wrap">
+          <input
+            autoFocus
+            list={`tag-pool-${page.id}`}
+            value={draft}
+            placeholder="输入标签回车…"
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={() => {
+              if (draft.trim()) addTag(draft);
+              setInputOpen(false);
+              onCloseAdding();
+            }}
+            onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing) return;
+              if (e.key === "Enter" || e.key === ",") {
+                e.preventDefault();
+                addTag(draft);
+              } else if (e.key === "Escape") {
+                setDraft("");
+                setInputOpen(false);
+                onCloseAdding();
+              }
+            }}
+          />
+          <datalist id={`tag-pool-${page.id}`}>
+            {workspaceTags
+              .filter((t) => !tags.includes(t))
+              .map((t) => (
+                <option key={t} value={t} />
+              ))}
+          </datalist>
+        </div>
+      ) : (
+        editable && (
+          <button type="button" className="text-btn small" onClick={() => setInputOpen(true)}>
+            <Plus size={12} /> 标签
+          </button>
+        )
+      )}
+
+      {editable && (
+        <button
+          type="button"
+          className="text-btn small ai-tag-btn"
+          disabled={aiTagging}
+          title="根据正文内容自动提取分类标签"
+          onClick={() => void runAiTagging()}
+        >
+          {aiTagging ? <LoaderCircle size={12} className="spin" /> : <Sparkles size={12} />}
+          {aiTagging ? "分析中…" : "AI 自动打标"}
+        </button>
       )}
     </div>
   );

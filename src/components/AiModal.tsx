@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { BlockNoteEditor } from "@blocknote/core";
 import {
   ArrowUp,
   Check,
@@ -17,30 +16,23 @@ import {
   Square,
   X,
 } from "lucide-react";
-import type { AiChatMessage, AiCitation } from "../../shared/types";
+import type { AiChatMessage } from "../../shared/types";
 import { loadAiConfig, saveAiConfig, streamAiChat, useAiConfig } from "../ai";
+import { INITIAL_AI_CHAT_STATE, transitionAiChat, useMachine, type AiChatTurn } from "../machines";
+import { getHeadlessParserEditor } from "../notionImport";
 import {
   createPage,
   fetchPage,
   flushPatch,
   navigate,
   reloadPageContent,
+  reportError,
   setAiOpen,
   setAiSettingsOpen,
   updatePage,
   useStore,
 } from "../store";
-import { schema } from "./Editor";
 import { cx } from "./Popover";
-
-interface Turn {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  reasoning?: string;
-  citations?: AiCitation[];
-  error?: string;
-}
 
 const STARTERS = [
   {
@@ -73,12 +65,15 @@ export function AiModal({ currentPageId }: { currentPageId: string | null }) {
   const cfg = useAiConfig();
   const currentPage = useStore((s) => (currentPageId ? s.pages[currentPageId] : undefined));
   const [scope, setScope] = useState<"workspace" | "page" | "none">(currentPageId ? "workspace" : "none");
-  const [turns, setTurns] = useState<Turn[]>([]);
+  const [chatState, sendChat] = useMachine(transitionAiChat, INITIAL_AI_CHAT_STATE);
   const [input, setInput] = useState("");
-  const [running, setRunning] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  const turns = chatState.turns;
+  const running = chatState.phase === "streaming";
+  const applying = chatState.phase === "applying";
 
   useEffect(() => {
     if (!cfg) void loadAiConfig().catch(() => {});
@@ -98,14 +93,13 @@ export function AiModal({ currentPageId }: { currentPageId: string | null }) {
 
   const sendPrompt = async (promptText?: string, forceScope?: "workspace" | "page" | "none") => {
     const text = (promptText ?? input).trim();
-    if (!text || running) return;
+    if (!text || chatState.phase !== "idle") return;
     const useScope = forceScope ?? scope;
     if (forceScope) setScope(forceScope);
     if (!promptText) setInput("");
 
-    const userTurn: Turn = { id: `${Date.now()}-u`, role: "user", content: text };
-    const assistantId = `${Date.now()}-a`;
-    const assistantTurn: Turn = { id: assistantId, role: "assistant", content: "" };
+    const userTurn: AiChatTurn = { id: `${Date.now()}-u`, role: "user", content: text };
+    const assistantTurn: AiChatTurn = { id: `${Date.now()}-a`, role: "assistant", content: "" };
     const historyMessages: AiChatMessage[] = [
       ...turns
         .filter((t) => !t.error && t.content.trim())
@@ -113,8 +107,7 @@ export function AiModal({ currentPageId }: { currentPageId: string | null }) {
       { role: "user", content: text },
     ];
 
-    setTurns((prev) => [...prev, userTurn, assistantTurn]);
-    setRunning(true);
+    sendChat({ type: "SUBMIT", userTurn, assistantTurn });
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
@@ -124,54 +117,64 @@ export function AiModal({ currentPageId }: { currentPageId: string | null }) {
         scope: useScope,
         pageId: currentPageId,
         signal: ctrl.signal,
-        onCitations: (citations) => {
-          setTurns((prev) => prev.map((t) => (t.id === assistantId ? { ...t, citations } : t)));
-        },
-        onReasoning: (_d, full) => {
-          setTurns((prev) => prev.map((t) => (t.id === assistantId ? { ...t, reasoning: full } : t)));
-        },
-        onDelta: (_d, full) => {
-          setTurns((prev) => prev.map((t) => (t.id === assistantId ? { ...t, content: full } : t)));
-        },
+        onCitations: (citations) => sendChat({ type: "CITATIONS", citations }),
+        onReasoning: (_d, full) => sendChat({ type: "REASONING", full }),
+        onDelta: (_d, full) => sendChat({ type: "DELTA", full }),
       });
+      sendChat({ type: "COMPLETE" });
     } catch (err) {
       if (!ctrl.signal.aborted) {
         const message = err instanceof Error ? err.message : String(err);
-        setTurns((prev) => prev.map((t) => (t.id === assistantId ? { ...t, error: message } : t)));
+        sendChat({ type: "FAIL", message });
       }
     } finally {
-      setRunning(false);
       abortRef.current = null;
     }
   };
 
   const stop = () => {
     abortRef.current?.abort();
-    setRunning(false);
+    sendChat({ type: "STOP" });
   };
 
   const saveAsNewPage = async (markdown: string) => {
-    const editor = BlockNoteEditor.create({ schema });
-    const headingMatch = /^#\s+(.+)$/m.exec(markdown);
-    const title = headingMatch?.[1]?.trim() || "AI 生成笔记";
-    const bodyMd = headingMatch ? markdown.replace(/^#\s+.+\n?/, "").trim() : markdown;
-    const blocks = bodyMd ? await editor.tryParseMarkdownToBlocks(bodyMd) : [];
-    const id = await createPage({ title, icon: "✨", content: blocks });
-    if (id) {
-      setAiOpen(false);
-      navigate(id);
+    if (chatState.phase !== "idle") return;
+    sendChat({ type: "APPLY_START" });
+    try {
+      const editor = getHeadlessParserEditor();
+      const headingMatch = /^#\s+(.+)$/m.exec(markdown);
+      const title = headingMatch?.[1]?.trim() || "AI 生成笔记";
+      const bodyMd = headingMatch ? markdown.replace(/^#\s+.+\n?/, "").trim() : markdown;
+      const blocks = bodyMd ? await editor.tryParseMarkdownToBlocks(bodyMd) : [];
+      const id = await createPage({ title, icon: "✨", content: blocks });
+      if (id) {
+        setAiOpen(false);
+        navigate(id);
+      }
+    } catch (err) {
+      reportError(err);
+    } finally {
+      sendChat({ type: "APPLY_DONE" });
     }
   };
 
   const appendToCurrentPage = async (markdown: string) => {
+    if (chatState.phase !== "idle") return;
     if (!currentPageId || !currentPage || currentPage.kind === "database" || currentPage.trashed || currentPage.locked) return;
-    const editor = BlockNoteEditor.create({ schema });
-    const blocks = await editor.tryParseMarkdownToBlocks(markdown);
-    const record = await fetchPage(currentPageId);
-    updatePage(currentPageId, { content: [...record.content, ...blocks] });
-    await flushPatch(currentPageId);
-    reloadPageContent(currentPageId);
-    setAiOpen(false);
+    sendChat({ type: "APPLY_START" });
+    try {
+      const editor = getHeadlessParserEditor();
+      const blocks = await editor.tryParseMarkdownToBlocks(markdown);
+      const record = await fetchPage(currentPageId);
+      updatePage(currentPageId, { content: [...record.content, ...blocks] });
+      await flushPatch(currentPageId);
+      reloadPageContent(currentPageId);
+      setAiOpen(false);
+    } catch (err) {
+      reportError(err);
+    } finally {
+      sendChat({ type: "APPLY_DONE" });
+    }
   };
 
   const canAppendCurrent =
@@ -184,7 +187,7 @@ export function AiModal({ currentPageId }: { currentPageId: string | null }) {
         role="dialog"
         aria-modal="true"
         aria-label="AI 助手"
-        data-ai-modal-state={running ? "streaming" : "idle"}
+        data-ai-modal-state={chatState.phase}
       >
         <header className="ai-modal-head">
           <span className="ai-brand">
@@ -258,7 +261,8 @@ export function AiModal({ currentPageId }: { currentPageId: string | null }) {
                 className="icon-btn"
                 title="清空对话"
                 aria-label="清空对话"
-                onClick={() => setTurns([])}
+                disabled={running || applying}
+                onClick={() => sendChat({ type: "CLEAR" })}
               >
                 <Eraser size={16} />
               </button>
@@ -370,13 +374,19 @@ export function AiModal({ currentPageId }: { currentPageId: string | null }) {
                       >
                         {copiedId === turn.id ? <Check size={13} /> : <Copy size={13} />} 复制
                       </button>
-                      <button type="button" className="ghost-btn small" onClick={() => void saveAsNewPage(turn.content)}>
-                        <FilePlus2 size={13} /> 存为新页面
+                      <button
+                        type="button"
+                        className="ghost-btn small"
+                        disabled={applying}
+                        onClick={() => void saveAsNewPage(turn.content)}
+                      >
+                        <FilePlus2 size={13} /> {applying ? "写入中…" : "存为新页面"}
                       </button>
                       {canAppendCurrent && (
                         <button
                           type="button"
                           className="ghost-btn small"
+                          disabled={applying}
                           onClick={() => void appendToCurrentPage(turn.content)}
                         >
                           插入当前页末尾

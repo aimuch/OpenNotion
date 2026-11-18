@@ -915,9 +915,12 @@ export async function unfurlUrl(rawUrl: string): Promise<UnfurlData> {
   if (target.protocol !== "http:" && target.protocol !== "https:") {
     throw new Error("只支持 http 和 https 网址");
   }
-  const host = target.hostname.toLowerCase();
+  const host = target.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal")) {
     throw new Error("不允许抓取本地或内网地址");
+  }
+  if (net.isIP(host) && isPrivateIp(host)) {
+    throw new Error("不允许抓取内网地址");
   }
   const fallback: UnfurlData = { url: target.href, title: target.hostname, description: "", siteName: target.hostname };
 

@@ -1,6 +1,9 @@
 import { useMemo, useSyncExternalStore } from "react";
 import type {
+  ClipRequest,
+  ClipResult,
   HistoryEntry,
+  McpConfigPublic,
   NewPageInput,
   PageMeta,
   PagePatch,
@@ -123,7 +126,10 @@ async function request<T>(url: string, init?: RequestInit & { json?: unknown }):
   const { json, ...rest } = init ?? {};
   const res = await fetch(url, {
     ...rest,
-    headers: json !== undefined ? { "Content-Type": "application/json" } : undefined,
+    headers:
+      json !== undefined
+        ? { "Content-Type": "application/json", ...(rest.headers as Record<string, string> | undefined) }
+        : rest.headers,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
   });
   const data = await res.json().catch(() => ({}));
@@ -131,7 +137,7 @@ async function request<T>(url: string, init?: RequestInit & { json?: unknown }):
   return data as T;
 }
 
-function reportError(err: unknown) {
+export function reportError(err: unknown) {
   const message = err instanceof Error ? err.message : String(err);
   set({ error: message });
   window.setTimeout(() => {
@@ -346,6 +352,41 @@ export async function uploadFile(file: File): Promise<string> {
   return data.url as string;
 }
 
+export async function clipWebUrl(input: ClipRequest): Promise<ClipResult> {
+  const res = await request<ClipResult>("/api/clip", { method: "POST", json: input });
+  setPages(res.pages);
+  return res;
+}
+
+export async function fetchMcpConfig(): Promise<McpConfigPublic> {
+  const { config } = await request<{ config: McpConfigPublic }>("/api/mcp/config");
+  return config;
+}
+
+export async function updateMcpConfig(patch: {
+  enabled?: boolean;
+  requireToken?: boolean;
+  rotateToken?: boolean;
+}): Promise<McpConfigPublic> {
+  const { config } = await request<{ config: McpConfigPublic }>("/api/mcp/config", {
+    method: "PUT",
+    json: patch,
+  });
+  return config;
+}
+
+export async function restoreBackupRecords(records: unknown[]): Promise<{ imported: number; updated: number }> {
+  const data = await request<{ imported: number; updated: number; pages: PageMeta[] }>("/api/backup/restore-records", {
+    method: "POST",
+    json: { records },
+  });
+  setPages(data.pages);
+  const nextRevs = { ...state.revisions };
+  for (const p of data.pages) nextRevs[p.id] = (nextRevs[p.id] ?? 0) + 1;
+  set({ revisions: nextRevs });
+  return { imported: data.imported, updated: data.updated };
+}
+
 /* ---------- 持久化自动保存状态机（debouncing → saving → idle | error） ---------- */
 
 interface Pending {
@@ -359,8 +400,18 @@ const pageSaveStates = new Map<string, { phase: PageSavePhase; error?: string }>
 const failedPatches = new Map<string, PagePatch>();
 const SAVE_DELAY = 500;
 
+function sameSaveSummary(a: SaveSummary, b: SaveSummary): boolean {
+  if (a.phase !== b.phase) return false;
+  if (a.phase === "saving" && b.phase === "saving") return a.count === b.count;
+  if (a.phase === "error" && b.phase === "error") {
+    return a.message === b.message && a.failedIds.join(",") === b.failedIds.join(",");
+  }
+  return true;
+}
+
 function syncSaveState() {
   const saveSummary = summarizeSaveStates(pageSaveStates);
+  if (sameSaveSummary(state.saveSummary, saveSummary)) return;
   set({
     saveSummary,
     saving: saveSummary.phase === "saving" ? saveSummary.count : 0,
@@ -404,13 +455,15 @@ export function flushPatch(id: string): Promise<void> {
   pendingPatches.delete(id);
   pageSaveStates.set(id, { phase: "saving" });
   syncSaveState();
-  // 同一页面的保存请求按顺序发出，避免旧内容覆盖新内容
+  // 同一页面的保存请求按顺序发出，避免旧内容覆盖新内容；仅做一次 JSON 序列化避免大文档双倍开销
+  const payloadStr = JSON.stringify(pending.patch);
   const next = previous
     .then(() =>
       request(`/api/pages/${id}`, {
         method: "PATCH",
-        json: pending.patch,
-        keepalive: byteLength(pending.patch) < 60_000,
+        headers: { "Content-Type": "application/json" },
+        body: payloadStr,
+        keepalive: payloadStr.length * 3 < 60_000,
       }),
     )
     .then(
@@ -445,10 +498,6 @@ export function retryFailedSaves(): Promise<void> {
   return flushAll();
 }
 
-function byteLength(value: unknown) {
-  return JSON.stringify(value).length * 3;
-}
-
 export function flushAll(): Promise<void> {
   const ids = new Set([...pendingPatches.keys(), ...inflight.keys()]);
   return Promise.all([...ids].map((id) => flushPatch(id))).then(() => {});
@@ -460,15 +509,21 @@ const winHooks = window as unknown as {
   __openNotionState?: () => Record<string, unknown>;
 };
 winHooks.__openNotionFlush = flushAll;
-winHooks.__openNotionState = () => ({
-  route: currentPageId(),
-  bootStatus: state.loaded ? "ready" : "loading",
-  topOverlay: topOverlayName(state.overlay),
-  overlay: state.overlay,
-  saveSummary: state.saveSummary,
-  drag: getDragSnapshot(),
-  pageCount: Object.keys(state.pages).length,
-});
+winHooks.__openNotionState = () => {
+  const visiblePages = Object.values(state.pages).filter((p) => !p.trashed && !p.hidden);
+  const tags = new Set(visiblePages.flatMap((p) => p.tags ?? []));
+  return {
+    route: currentPageId(),
+    bootStatus: state.loaded ? "ready" : "loading",
+    topOverlay: topOverlayName(state.overlay),
+    overlay: state.overlay,
+    saveSummary: state.saveSummary,
+    drag: getDragSnapshot(),
+    pageCount: Object.keys(state.pages).length,
+    visiblePageCount: visiblePages.length,
+    tagCount: tags.size,
+  };
+};
 
 let lastFocusSync = 0;
 function triggerAutoDiskSync() {
@@ -538,6 +593,22 @@ export function setSearchOpen(open: boolean) {
 
 export function setAiOpen(open: boolean) {
   sendOverlay({ type: open ? "OPEN_AI" : "CLOSE_AI" });
+}
+
+export function setClipperOpen(open: boolean) {
+  sendOverlay({ type: open ? "OPEN_CLIPPER" : "CLOSE_CLIPPER" });
+}
+
+export function openHistoryModal() {
+  sendOverlay({ type: "OPEN_HISTORY" });
+}
+
+export function openPosterModal() {
+  sendOverlay({ type: "OPEN_POSTER" });
+}
+
+export function closePageModal() {
+  sendOverlay({ type: "CLOSE_PAGE_MODAL" });
 }
 
 export function openSettings(tab: SettingsTab = "appearance") {

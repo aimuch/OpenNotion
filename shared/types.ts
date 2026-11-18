@@ -166,6 +166,9 @@ export interface PageComment {
   id: string;
   author: string;
   text: string;
+  /** 选中正文划词批注时引用的原文片段 */
+  quote?: string;
+  resolved?: boolean;
   createdAt: number;
 }
 
@@ -177,6 +180,8 @@ export interface PageMeta {
   cover: string | null;
   /** 封面图纵向裁剪焦点百分比（0 ~ 100，默认 50） */
   coverY?: number;
+  /** 多维页面分类标签（不含 # 前缀） */
+  tags?: string[];
   parentId: string | null;
   order: number;
   favorite: boolean;
@@ -213,6 +218,7 @@ export type PagePatch = Partial<
     | "icon"
     | "cover"
     | "coverY"
+    | "tags"
     | "favorite"
     | "fullWidth"
     | "smallText"
@@ -231,6 +237,7 @@ export interface NewPageInput {
   parentId?: string | null;
   title?: string;
   icon?: string | null;
+  tags?: string[];
   kind?: PageKind;
   database?: DatabaseDef | null;
   props?: Record<string, PropValue>;
@@ -332,4 +339,30 @@ export interface StorageInfo {
   defaultDataDir?: string;
   isDesktop: boolean;
   isCustomDir: boolean;
+}
+
+export interface McpConfigPublic {
+  enabled: boolean;
+  requireToken: boolean;
+  token: string;
+  endpoint: string;
+  stdioCommand: string;
+  tools: { name: string; description: string }[];
+}
+
+export interface ClipRequest {
+  url: string;
+  title?: string;
+  html?: string;
+  text?: string;
+  tags?: string[];
+  parentId?: string | null;
+}
+
+export interface ClipResult {
+  id: string;
+  title: string;
+  siteName: string;
+  blockCount: number;
+  pages: PageMeta[];
 }

@@ -43,6 +43,10 @@ const colsListeners = new Map<string, Set<() => void>>();
 
 function publishCols(key: string, json: string) {
   if (colsStore.get(key) === json) return;
+  if (colsStore.size > 200) {
+    const oldest = colsStore.keys().next().value;
+    if (oldest && !colsListeners.has(oldest)) colsStore.delete(oldest);
+  }
   colsStore.set(key, json);
   colsListeners.get(key)?.forEach((cb) => cb());
 }
@@ -59,7 +63,10 @@ function useColsJson(key: string, initial: string): string {
       set.add(cb);
       return () => {
         set?.delete(cb);
-        if (set && set.size === 0) colsListeners.delete(key);
+        if (set && set.size === 0) {
+          colsListeners.delete(key);
+          colsStore.delete(key);
+        }
       };
     },
     () => colsStore.get(key) ?? initial,

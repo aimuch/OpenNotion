@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { CircleAlert, LoaderCircle, PanelLeft, Plus } from "lucide-react";
 import { AiModal } from "./components/AiModal";
 import { AiSettingsModal } from "./components/AiSettingsModal";
+import { ClipperModal } from "./components/ClipperModal";
 import { Logo } from "./components/Logo";
 import { RowDrawer } from "./components/database/RowDrawer";
 import { topOverlayName, transitionImport, useMachine } from "./machines";
@@ -32,6 +33,7 @@ export function App() {
   const overlay = useStore((s) => s.overlay);
   const searchOpen = overlay.modal === "search";
   const aiOpen = overlay.modal === "ai";
+  const clipperOpen = overlay.modal === "clipper";
   const settingsOpen = overlay.aiSettings;
   const peekRowId = overlay.peekRowId;
   const topOverlay = topOverlayName(overlay);
@@ -108,6 +110,10 @@ export function App() {
         e.preventDefault();
         e.stopPropagation();
         sendOverlay({ type: "TOGGLE_AI" });
+      } else if (key === "c" && e.shiftKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        sendOverlay({ type: "TOGGLE_CLIPPER" });
       } else if (e.key === ",") {
         e.preventDefault();
         e.stopPropagation();
@@ -201,6 +207,7 @@ export function App() {
       {peekRowId && <RowDrawer id={peekRowId} />}
       {searchOpen && <SearchModal />}
       {aiOpen && <AiModal currentPageId={current} />}
+      {clipperOpen && <ClipperModal />}
       {settingsOpen && (
         <AiSettingsModal
           onClose={closeSettings}
@@ -217,10 +224,16 @@ export function App() {
             className="import-modal"
             role="dialog"
             aria-modal="true"
-            aria-label="导入 Notion 导出包"
+            aria-label="导入与恢复工作区数据"
             data-import-state={importState.status}
           >
-            <h2>导入 Notion 导出包</h2>
+            <h2>
+              {importState.status === "done" && importState.result.source === "backup"
+                ? "备份无损还原完成"
+                : importState.status === "done" && importState.result.source === "obsidian"
+                  ? "Obsidian / Markdown 笔记库导入完成"
+                  : "导入笔记与数据库压缩包"}
+            </h2>
             {importState.status === "running" && (
               <p className="import-progress" aria-live="polite">
                 <LoaderCircle size={15} className="spin" /> {importState.text}
@@ -229,10 +242,16 @@ export function App() {
             {importState.status === "done" && (
               <>
                 <p>
-                  导入完成：{importState.result.pages} 个页面，{importState.result.databases} 个数据库（共{" "}
+                  已处理：{importState.result.pages} 个页面，{importState.result.databases} 个数据库（共{" "}
                   {importState.result.rows} 行），{importState.result.files} 个图片或附件。
                 </p>
-                <p className="import-note">内容都放在“Notion 导入”页面下面。数据库的列类型是按内容推断的，其余默认保留为文本。</p>
+                <p className="import-note">
+                  {importState.result.source === "backup"
+                    ? "所有页面、多维数据库视图、公式与标签已按备份原样无损恢复。"
+                    : importState.result.source === "obsidian"
+                      ? "目录层级、YAML 标签及 [[双链]] 已自动转换为原生页面树与双向链接。"
+                      : "内容已归入新创建的导入页面下；数据库的列类型已根据内容自动识别。"}
+                </p>
                 <div className="import-actions">
                   <button
                     type="button"

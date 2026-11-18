@@ -12,6 +12,7 @@ import {
   Lock,
   LockOpen,
   PencilLine,
+  Share2,
   Star,
   StarOff,
   Trash2,
@@ -60,6 +61,7 @@ interface Props {
   onExport?: () => void;
   exportLabel?: string;
   onExportHtml?: () => void;
+  onPoster?: () => void;
   showLayout?: boolean;
   /** 打开页面历史（只有正文页面才有） */
   onHistory?: () => void;
@@ -76,6 +78,7 @@ export function PageMenu({
   onExport,
   exportLabel,
   onExportHtml,
+  onPoster,
   showLayout,
   onHistory,
   wordCount,
@@ -170,6 +173,7 @@ export function PageMenu({
         onClick={run(() => updatePage(page.id, { template: !page.template }))}
       />
       {onHistory && <MenuItem icon={<History size={16} />} label="页面历史" onClick={run(onHistory)} />}
+      {onPoster && <MenuItem icon={<Share2 size={16} />} label="生成分享海报 / 打印 PDF" onClick={run(onPoster)} />}
       {onExport && <MenuItem icon={<Download size={16} />} label={exportLabel ?? "导出为 Markdown"} onClick={run(onExport)} />}
       {onExportHtml && <MenuItem icon={<FileCode2 size={16} />} label="导出为 HTML" onClick={run(onExportHtml)} />}
       <MenuDivider />

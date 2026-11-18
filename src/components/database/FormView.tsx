@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check, Plus, Send } from "lucide-react";
 import type { DatabaseDef, PageMeta, PropertyDef, PropValue, ViewDef } from "../../../shared/types";
 import { isComputed, visibleProperties } from "../../db";
+import { transitionFormSubmission, useMachine } from "../../machines";
 import { setPeekRowId, useStore } from "../../store";
 import { cx } from "../Popover";
 import { PropIcon, Tag } from "./cells";
@@ -14,14 +15,15 @@ interface Props {
   onSubmitRow: (title: string, props: Record<string, PropValue>) => Promise<string | null>;
 }
 
-/** 数据库表单视图（Notion Forms）：把数据库结构转化为结构化信息收集表单，一键提交生成新行 */
+/** 数据库表单视图（Notion Forms）：显式 FormSubmissionState 状态机管理编辑、提交中、成功与异常反馈 */
 export function FormView({ page, db, view, onPatchView, onSubmitRow }: Props) {
   const allPages = useStore((s) => s.pages);
   const fields = visibleProperties(db, view).filter((p) => !isComputed(p.type) && p.type !== "button");
   const [title, setTitle] = useState("");
   const [values, setValues] = useState<Record<string, PropValue>>({});
-  const [submitting, setSubmitting] = useState(false);
-  const [submittedId, setSubmittedId] = useState<string | null>(null);
+  const [formState, sendForm] = useMachine(transitionFormSubmission, { phase: "editing" });
+
+  const submitting = formState.phase === "submitting";
 
   const setVal = (propId: string, val: PropValue) => {
     setValues((prev) => ({ ...prev, [propId]: val }));
@@ -30,22 +32,25 @@ export function FormView({ page, db, view, onPatchView, onSubmitRow }: Props) {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim() || submitting) return;
-    setSubmitting(true);
+    sendForm({ type: "SUBMIT_START" });
     try {
       const id = await onSubmitRow(title.trim(), values);
       if (id) {
-        setSubmittedId(id);
+        sendForm({ type: "SUBMIT_SUCCESS", rowId: id });
         setTitle("");
         setValues({});
+      } else {
+        sendForm({ type: "SUBMIT_ERROR", message: "未能创建记录，请稍后重试" });
       }
-    } finally {
-      setSubmitting(false);
+    } catch (err) {
+      sendForm({ type: "SUBMIT_ERROR", message: err instanceof Error ? err.message : String(err) });
     }
   };
 
-  if (submittedId) {
+  if (formState.phase === "submitted") {
+    const submittedId = formState.rowId;
     return (
-      <div className="db-form-wrap">
+      <div className="db-form-wrap" data-form-state="submitted">
         <div className="db-form-card db-form-done" role="status">
           <div className="db-form-done-badge">
             <Check size={20} />
@@ -53,7 +58,7 @@ export function FormView({ page, db, view, onPatchView, onSubmitRow }: Props) {
           <h3>已成功提交到《{page.title || "无标题数据库"}》</h3>
           <p>新记录已写入本地数据库并自动触发相关规则。</p>
           <div className="db-form-done-actions">
-            <button type="button" className="primary-btn small" onClick={() => setSubmittedId(null)}>
+            <button type="button" className="primary-btn small" onClick={() => sendForm({ type: "RESET" })}>
               <Plus size={14} /> 再填一份
             </button>
             <button type="button" className="ghost-btn small" onClick={() => setPeekRowId(submittedId)}>
@@ -66,7 +71,7 @@ export function FormView({ page, db, view, onPatchView, onSubmitRow }: Props) {
   }
 
   return (
-    <div className="db-form-wrap">
+    <div className="db-form-wrap" data-form-state={formState.phase}>
       <form className="db-form-card" onSubmit={(e) => void handleSubmit(e)}>
         <div className="db-form-head">
           <h3>{page.title || "数据收集表单"}</h3>
@@ -101,6 +106,12 @@ export function FormView({ page, db, view, onPatchView, onSubmitRow }: Props) {
             />
           ))}
         </div>
+
+        {formState.phase === "error" && (
+          <div className="ai-status err" style={{ marginTop: 12 }}>
+            {formState.message}
+          </div>
+        )}
 
         <div className="db-form-foot">
           <button type="submit" className="primary-btn" disabled={!title.trim() || submitting}>

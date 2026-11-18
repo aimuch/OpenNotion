@@ -3,10 +3,10 @@
  * 全部在浏览器里完成：解压 → 还原页面层级 → Markdown 转成块 → 通过本地接口写入。
  */
 import { BlockNoteEditor } from "@blocknote/core";
-import type { DatabaseDef, PropertyDef, PropValue } from "../shared/types";
-import { schema } from "./components/Editor";
+import type { DatabaseDef, PageRecord, PropertyDef, PropValue } from "../shared/types";
+import { schema, type NoteEditor } from "./components/Editor";
 import { shortId } from "./db";
-import { createPage, flushPatch, updatePage, uploadFile } from "./store";
+import { createPage, flushPatch, restoreBackupRecords, updatePage, uploadFile } from "./store";
 
 interface ZipEntry {
   path: string;
@@ -19,6 +19,17 @@ export interface ImportResult {
   databases: number;
   rows: number;
   files: number;
+  source?: "backup" | "obsidian" | "notion";
+}
+
+let cachedParserEditor: NoteEditor | null = null;
+
+/** 复用同一个无头 BlockNote 解析实例，避免每次导入或 AI 落盘重复初始化 ProseMirror Schema */
+export function getHeadlessParserEditor(): NoteEditor {
+  if (!cachedParserEditor) {
+    cachedParserEditor = BlockNoteEditor.create({ schema });
+  }
+  return cachedParserEditor;
 }
 
 async function inflate(data: Uint8Array): Promise<Uint8Array> {
@@ -159,14 +170,21 @@ function upgradePageMentions(node: unknown, titles: Map<string, string>) {
   for (let i = 0; i < node.length; i++) {
     const item = node[i] as Record<string, unknown> | null;
     if (!item || typeof item !== "object") continue;
-    const m = item.type === "link" && typeof item.href === "string" ? /^#\/([a-f0-9]{16})$/.exec(item.href) : null;
-    if (m && titles.has(m[1])) {
-      const label = Array.isArray(item.content)
-        ? item.content.map((c: { text?: string }) => c?.text ?? "").join("").trim()
-        : "";
-      if (!label || label === titles.get(m[1])) {
-        node[i] = { type: "pageMention", props: { pageId: m[1] } };
+    if (item.type === "link" && typeof item.href === "string") {
+      const directMention = /^#mention\/([a-f0-9]{16})$/.exec(item.href);
+      if (directMention && titles.has(directMention[1])) {
+        node[i] = { type: "pageMention", props: { pageId: directMention[1] } };
         continue;
+      }
+      const m = /^#\/([a-f0-9]{16})$/.exec(item.href);
+      if (m && titles.has(m[1])) {
+        const label = Array.isArray(item.content)
+          ? item.content.map((c: { text?: string }) => c?.text ?? "").join("").trim()
+          : "";
+        if (!label || label === titles.get(m[1])) {
+          node[i] = { type: "pageMention", props: { pageId: m[1] } };
+          continue;
+        }
       }
     }
     for (const key of ["content", "children", "rows", "cells"]) {
@@ -179,12 +197,40 @@ interface Node {
   key: string;
   kind: "page" | "database";
   isAllCsv?: boolean;
-  entry: ZipEntry;
+  entry?: ZipEntry;
   title: string;
+  icon?: string | null;
+  tags?: string[];
   text: string;
   parentKey: string | null;
   id?: string;
   isRow?: boolean;
+}
+
+function extractFrontmatter(raw: string): { body: string; title?: string; icon?: string; tags?: string[] } {
+  const m = /^---\n([\s\S]*?)\n---\n?/.exec(raw);
+  if (!m) return { body: raw };
+  const fm = m[1];
+  const body = raw.slice(m[0].length);
+  const title = /^title:\s*["']?(.+?)["']?\s*$/m.exec(fm)?.[1]?.trim();
+  const icon = /^icon:\s*["']?(.+?)["']?\s*$/m.exec(fm)?.[1]?.trim();
+  let tags: string[] | undefined;
+  const inlineTags = /^tags:\s*\[([^\]]*)\]/m.exec(fm);
+  if (inlineTags) {
+    tags = inlineTags[1]
+      .split(",")
+      .map((s) => s.trim().replace(/^["'#]+|["']+$/g, ""))
+      .filter(Boolean);
+  } else {
+    const listTags = /^tags:\s*\n((?:\s*-\s*.+\n?)+)/m.exec(fm);
+    if (listTags) {
+      tags = listTags[1]
+        .split("\n")
+        .map((l) => l.replace(/^\s*-\s*/, "").trim().replace(/^["'#]+|["']+$/g, ""))
+        .filter(Boolean);
+    }
+  }
+  return { body, title, icon, tags };
 }
 
 export async function importNotionZip(file: File, onProgress: (text: string) => void): Promise<ImportResult> {
@@ -199,8 +245,52 @@ export async function importNotionZip(file: File, onProgress: (text: string) => 
   const byPath = new Map(entries.map((e) => [e.path, e]));
   const decoder = new TextDecoder("utf-8");
 
+  // 优先识别 OpenNotion 双轨备份包（含 .opennotion/pages/*.json），支持 100% 无损恢复结构化元数据与附件
+  const backupJsonEntries = entries.filter(
+    (e) => e.path.startsWith(".opennotion/pages/") && e.path.toLowerCase().endsWith(".json"),
+  );
+  if (backupJsonEntries.length > 0) {
+    const uploadEntries = entries.filter((e) => e.path.startsWith("uploads/") && !e.path.endsWith("/"));
+    const uploadRemap = new Map<string, string>();
+    let uploadedFiles = 0;
+    for (const up of uploadEntries) {
+      onProgress(`正在恢复附件 ${++uploadedFiles} / ${uploadEntries.length}`);
+      const bytes = await up.read();
+      const oldName = basename(up.path);
+      const newUrl = await uploadFile(new File([bytes.slice()], oldName));
+      uploadRemap.set(`/uploads/${oldName}`, newUrl);
+    }
+    onProgress(`正在无损还原 ${backupJsonEntries.length} 个页面与数据库…`);
+    const records: PageRecord[] = [];
+    for (const je of backupJsonEntries) {
+      let jsonStr = decoder.decode(await je.read());
+      for (const [oldUrl, newUrl] of uploadRemap) {
+        if (jsonStr.includes(oldUrl)) jsonStr = jsonStr.replaceAll(oldUrl, newUrl);
+      }
+      try {
+        records.push(JSON.parse(jsonStr) as PageRecord);
+      } catch {
+        /* 跳过损坏条目 */
+      }
+    }
+    await restoreBackupRecords(records);
+    const visible = records.filter((r) => !r.hidden && !r.trashed);
+    const dbSet = new Set(visible.filter((r) => r.kind === "database").map((r) => r.id));
+    const firstRoot = visible.find((r) => !r.parentId) ?? visible[0];
+    return {
+      rootId: firstRoot?.id ?? "",
+      pages: visible.filter((r) => r.kind === "page" && (!r.parentId || !dbSet.has(r.parentId))).length,
+      databases: dbSet.size,
+      rows: visible.filter((r) => r.parentId && dbSet.has(r.parentId)).length,
+      files: uploadedFiles,
+      source: "backup",
+    };
+  }
+
   const nodes = new Map<string, Node>();
   for (const entry of entries) {
+    // 跳过 Obsidian / Git 隐藏配置目录
+    if (entry.path.split("/").some((seg) => seg.startsWith("."))) continue;
     const lower = entry.path.toLowerCase();
     const isMd = lower.endsWith(".md");
     const isAllCsv = lower.endsWith("_all.csv");
@@ -213,20 +303,43 @@ export async function importNotionZip(file: File, onProgress: (text: string) => 
       if (isMd) continue;
       if (isAllCsv && prev.kind === "database") continue;
     }
-    const text = decoder.decode(await entry.read()).replace(/\r\n?/g, "\n");
-    const heading = isMd ? /^# (.+)$/m.exec(text)?.[1]?.trim() : undefined;
+    const rawText = decoder.decode(await entry.read()).replace(/\r\n?/g, "\n");
+    const fm = isMd ? extractFrontmatter(rawText) : { body: rawText };
+    const heading = isMd ? /^# (.+)$/m.exec(fm.body)?.[1]?.trim() : undefined;
     nodes.set(key, {
       key,
       kind: isCsv ? "database" : "page",
       isAllCsv,
       entry,
-      title: heading || stripHex(basename(key)),
-      text,
+      title: fm.title || heading || stripHex(basename(key)),
+      icon: fm.icon ?? null,
+      tags: fm.tags,
+      text: fm.body,
       parentKey: null,
     });
   }
   if (nodes.size === 0) {
-    throw new Error("压缩包里没有找到 Markdown 或 CSV 文件。请在 Notion 导出时选择“Markdown & CSV”格式。");
+    throw new Error("压缩包里没有找到 Markdown、CSV 或备份文件。支持导入 Notion、Obsidian 笔记库及 OpenNotion 备份包。");
+  }
+
+  // 为 Obsidian / 文件夹式笔记库自动补建纯目录节点（当某文件夹没有同名 .md 时）
+  for (const key of [...nodes.keys()]) {
+    const parts = key.split("/");
+    for (let d = 1; d < parts.length; d++) {
+      const dirKey = parts.slice(0, d).join("/");
+      const existsExact = nodes.has(dirKey);
+      const existsWithHex = [...nodes.keys()].some((k) => stripHexPath(k) === stripHexPath(dirKey));
+      if (!existsExact && !existsWithHex) {
+        nodes.set(dirKey, {
+          key: dirKey,
+          kind: "page",
+          title: stripHex(basename(dirKey)),
+          icon: "📁",
+          text: "",
+          parentKey: null,
+        });
+      }
+    }
   }
 
   // 子页面放在与父页面同名的文件夹里；有的导出里文件夹名不带那串 id，所以再按去掉 id 的名字找一次
@@ -242,11 +355,14 @@ export async function importNotionZip(file: File, onProgress: (text: string) => 
     }
   }
 
+  const hasNotionHex = [...nodes.keys()].some((k) => HEX_SUFFIX.test(basename(k)));
+  const sourceKind: "notion" | "obsidian" = hasNotionHex ? "notion" : "obsidian";
   const stamp = new Date().toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
-  const rootId = await createPage({ title: `Notion 导入 · ${stamp}`, icon: "📥", quiet: true });
+  const rootTitle = sourceKind === "notion" ? `Notion 导入 · ${stamp}` : `笔记库导入 · ${stamp}`;
+  const rootId = await createPage({ title: rootTitle, icon: "📥", quiet: true });
   if (!rootId) throw new Error("无法创建页面，导入已中止。");
 
-  const result: ImportResult = { rootId, pages: 0, databases: 0, rows: 0, files: 0 };
+  const result: ImportResult = { rootId, pages: 0, databases: 0, rows: 0, files: 0, source: sourceKind };
   const ordered = [...nodes.values()].sort((a, b) => a.key.split("/").length - b.key.split("/").length);
   /** 数据库 key → 按标题排队的行 id，用来把 CSV 里的行和同名的 .md 正文对上 */
   const rowQueues = new Map<string, Map<string, string[]>>();
@@ -299,19 +415,29 @@ export async function importNotionZip(file: File, onProgress: (text: string) => 
     } else {
       result.pages++;
     }
-    const id = await createPage({ parentId, title: node.title, quiet: true });
+    const id = await createPage({
+      parentId,
+      title: node.title,
+      icon: node.icon ?? null,
+      tags: node.tags,
+      quiet: true,
+    });
     if (!id) throw fail();
     node.id = id;
   }
 
   // 第二遍：所有页面都有 id 了，再转换正文，这样页面之间的链接才能指向新页面
-  const editor = BlockNoteEditor.create({ schema });
+  const editor = getHeadlessParserEditor();
   const uploaded = new Map<string, string>();
   const titlesById = new Map<string, string>();
+  const idByTitleLower = new Map<string, string>();
   for (const n of ordered) {
-    if (n.id) titlesById.set(n.id, n.title);
+    if (n.id) {
+      titlesById.set(n.id, n.title);
+      idByTitleLower.set(n.title.trim().toLowerCase(), n.id);
+    }
   }
-  const pagesWithBody = ordered.filter((n) => n.kind === "page" && n.id);
+  const pagesWithBody = ordered.filter((n) => n.kind === "page" && n.id && n.entry);
   done = 0;
   for (const node of pagesWithBody) {
     onProgress(`正在导入正文 ${++done} / ${pagesWithBody.length}`);
@@ -326,7 +452,15 @@ export async function importNotionZip(file: File, onProgress: (text: string) => 
       if (i > 0 && (i === lines.length || lines[i].trim() === "")) md = lines.slice(i).join("\n").replace(/^\n+/, "");
     }
 
-    const dir = dirname(node.entry.path);
+    // 转换 Obsidian [[页面标题]] 或 [[页面标题|别名]] 双链为原生页面引用芯片
+    md = md.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_all, rawTarget: string, alias?: string) => {
+      const cleanName = basename(rawTarget.trim()).replace(/\.md$/i, "");
+      const targetId = idByTitleLower.get(cleanName.toLowerCase());
+      const label = (alias ?? cleanName).trim();
+      return targetId ? `[${label}](#mention/${targetId})` : `**${label}**`;
+    });
+
+    const dir = dirname(node.entry!.path);
     const links = [...md.matchAll(/(!?)\[([^\]]*)\]\(([^)\s]+)\)/g)];
     for (const match of links) {
       const [whole, bang, label, target] = match;

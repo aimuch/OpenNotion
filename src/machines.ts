@@ -6,7 +6,7 @@
  * 同时为界面提供统一的 data-* 状态标记与只读诊断快照。
  */
 import { useCallback, useReducer } from "react";
-import type { AiChatMessage, HistoryEntry, PageRecord } from "../shared/types";
+import type { AiChatMessage, AiCitation, HistoryEntry, PageRecord, SearchHit } from "../shared/types";
 import type { ImportResult } from "./notionImport";
 
 /** 轻量状态机 Hook：用纯 reducer 驱动显式事件转移 */
@@ -53,11 +53,13 @@ export function summarizeSaveStates(
  *    按 Esc 时严格按“最上层优先（LIFO）”逐层关闭，绝不一次关光。
  * ========================================================= */
 
-export type PrimaryModal = "none" | "search" | "ai";
-export type SettingsTab = "appearance" | "sync" | "ai" | "trash";
+export type PrimaryModal = "none" | "search" | "ai" | "clipper";
+export type PageSubModal = "none" | "history" | "poster";
+export type SettingsTab = "appearance" | "sync" | "ai" | "mcp" | "trash";
 
 export interface OverlayState {
   modal: PrimaryModal;
+  pageModal?: PageSubModal;
   aiSettings: boolean;
   settingsTab?: SettingsTab;
   peekRowId: string | null;
@@ -70,6 +72,12 @@ export type OverlayEvent =
   | { type: "OPEN_AI" }
   | { type: "CLOSE_AI" }
   | { type: "TOGGLE_AI" }
+  | { type: "OPEN_CLIPPER" }
+  | { type: "CLOSE_CLIPPER" }
+  | { type: "TOGGLE_CLIPPER" }
+  | { type: "OPEN_HISTORY" }
+  | { type: "OPEN_POSTER" }
+  | { type: "CLOSE_PAGE_MODAL" }
   | { type: "OPEN_SETTINGS"; tab?: SettingsTab }
   | { type: "CLOSE_SETTINGS" }
   | { type: "TOGGLE_SETTINGS"; tab?: SettingsTab }
@@ -82,26 +90,42 @@ export type OverlayEvent =
 
 export const INITIAL_OVERLAY_STATE: OverlayState = {
   modal: "none",
+  pageModal: "none",
   aiSettings: false,
   peekRowId: null,
 };
 
 export function transitionOverlay(state: OverlayState, event: OverlayEvent): OverlayState {
+  const curPageModal = state.pageModal ?? "none";
   switch (event.type) {
     case "OPEN_SEARCH":
-      return { ...state, modal: "search", aiSettings: false };
+      return { ...state, modal: "search", pageModal: "none", aiSettings: false };
     case "CLOSE_SEARCH":
       return state.modal === "search" ? { ...state, modal: "none" } : state;
     case "TOGGLE_SEARCH":
       return state.modal === "search"
         ? { ...state, modal: "none" }
-        : { ...state, modal: "search", aiSettings: false };
+        : { ...state, modal: "search", pageModal: "none", aiSettings: false };
     case "OPEN_AI":
-      return { ...state, modal: "ai" };
+      return { ...state, modal: "ai", pageModal: "none" };
     case "CLOSE_AI":
       return state.modal === "ai" ? { ...state, modal: "none" } : state;
     case "TOGGLE_AI":
-      return state.modal === "ai" ? { ...state, modal: "none" } : { ...state, modal: "ai" };
+      return state.modal === "ai" ? { ...state, modal: "none" } : { ...state, modal: "ai", pageModal: "none" };
+    case "OPEN_CLIPPER":
+      return { ...state, modal: "clipper", pageModal: "none", aiSettings: false };
+    case "CLOSE_CLIPPER":
+      return state.modal === "clipper" ? { ...state, modal: "none" } : state;
+    case "TOGGLE_CLIPPER":
+      return state.modal === "clipper"
+        ? { ...state, modal: "none" }
+        : { ...state, modal: "clipper", pageModal: "none", aiSettings: false };
+    case "OPEN_HISTORY":
+      return { ...state, pageModal: "history", modal: "none", aiSettings: false };
+    case "OPEN_POSTER":
+      return { ...state, pageModal: "poster", modal: "none", aiSettings: false };
+    case "CLOSE_PAGE_MODAL":
+      return curPageModal !== "none" ? { ...state, pageModal: "none" } : state;
     case "OPEN_SETTINGS":
       return { ...state, aiSettings: true, settingsTab: event.tab ?? state.settingsTab ?? "appearance" };
     case "CLOSE_SETTINGS":
@@ -119,17 +143,21 @@ export function transitionOverlay(state: OverlayState, event: OverlayEvent): Ove
     case "CLOSE_PEEK":
       return state.peekRowId ? { ...state, peekRowId: null } : state;
     case "NAVIGATED":
-      return { ...state, modal: "none", peekRowId: null };
+      return { ...state, modal: "none", pageModal: "none", peekRowId: null };
     case "ESCAPE":
       if (state.aiSettings) return { ...state, aiSettings: false };
+      if (curPageModal !== "none") return { ...state, pageModal: "none" };
       if (state.modal !== "none") return { ...state, modal: "none" };
       if (state.peekRowId) return { ...state, peekRowId: null };
       return state;
   }
 }
 
-export function topOverlayName(state: OverlayState): "ai-settings" | "search" | "ai" | "peek" | "none" {
+export function topOverlayName(
+  state: OverlayState,
+): "ai-settings" | "history" | "poster" | "search" | "ai" | "clipper" | "peek" | "none" {
   if (state.aiSettings) return "ai-settings";
+  if (state.pageModal && state.pageModal !== "none") return state.pageModal;
   if (state.modal !== "none") return state.modal;
   if (state.peekRowId) return "peek";
   return "none";
@@ -374,4 +402,269 @@ export function getDraggedRowForDb(dbId: string): string | null {
 
 export function getDragSnapshot(): DragSession {
   return currentDrag;
+}
+
+/* =========================================================
+ * 8. 全局 AI 问答会话状态机（AI Modal Session Machine）
+ *    消除 running / savingAction 等离散布尔竞态，防止重复点击“存为新页面 / 追加到本页”产生脏副本
+ * ========================================================= */
+
+export interface AiChatTurn {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  reasoning?: string;
+  citations?: AiCitation[];
+  error?: string;
+}
+
+export interface AiChatSessionState {
+  phase: "idle" | "streaming" | "applying";
+  activeAssistantId: string | null;
+  turns: AiChatTurn[];
+}
+
+export type AiChatSessionEvent =
+  | { type: "SUBMIT"; userTurn: AiChatTurn; assistantTurn: AiChatTurn }
+  | { type: "CITATIONS"; citations: AiCitation[] }
+  | { type: "REASONING"; full: string }
+  | { type: "DELTA"; full: string }
+  | { type: "COMPLETE" }
+  | { type: "STOP" }
+  | { type: "FAIL"; message: string }
+  | { type: "CLEAR" }
+  | { type: "APPLY_START" }
+  | { type: "APPLY_DONE" };
+
+export const INITIAL_AI_CHAT_STATE: AiChatSessionState = {
+  phase: "idle",
+  activeAssistantId: null,
+  turns: [],
+};
+
+export function transitionAiChat(state: AiChatSessionState, event: AiChatSessionEvent): AiChatSessionState {
+  switch (event.type) {
+    case "SUBMIT":
+      if (state.phase !== "idle") return state;
+      return {
+        phase: "streaming",
+        activeAssistantId: event.assistantTurn.id,
+        turns: [...state.turns, event.userTurn, event.assistantTurn],
+      };
+    case "CITATIONS":
+      if (state.phase !== "streaming" || !state.activeAssistantId) return state;
+      return {
+        ...state,
+        turns: state.turns.map((t) => (t.id === state.activeAssistantId ? { ...t, citations: event.citations } : t)),
+      };
+    case "REASONING":
+      if (state.phase !== "streaming" || !state.activeAssistantId) return state;
+      return {
+        ...state,
+        turns: state.turns.map((t) => (t.id === state.activeAssistantId ? { ...t, reasoning: event.full } : t)),
+      };
+    case "DELTA":
+      if (state.phase !== "streaming" || !state.activeAssistantId) return state;
+      return {
+        ...state,
+        turns: state.turns.map((t) => (t.id === state.activeAssistantId ? { ...t, content: event.full } : t)),
+      };
+    case "COMPLETE":
+    case "STOP":
+      if (state.phase !== "streaming") return state;
+      return { ...state, phase: "idle", activeAssistantId: null };
+    case "FAIL":
+      if (!state.activeAssistantId) return { ...state, phase: "idle" };
+      return {
+        phase: "idle",
+        activeAssistantId: null,
+        turns: state.turns.map((t) => (t.id === state.activeAssistantId ? { ...t, error: event.message } : t)),
+      };
+    case "CLEAR":
+      if (state.phase === "streaming" || state.phase === "applying") return state;
+      return INITIAL_AI_CHAT_STATE;
+    case "APPLY_START":
+      return state.phase === "idle" ? { ...state, phase: "applying" } : state;
+    case "APPLY_DONE":
+      return state.phase === "applying" ? { ...state, phase: "idle" } : state;
+  }
+}
+
+/* =========================================================
+ * 9. 网页剪藏任务状态机（Web Clipper Workflow Machine）
+ *    抓取进行中锁定页签切换与误触关闭，确保异步落库原子完成
+ * ========================================================= */
+
+export interface ClipperModalState {
+  tab: "url" | "bookmarklet";
+  job:
+    | { status: "idle" }
+    | { status: "clipping"; url: string }
+    | { status: "error"; message: string };
+}
+
+export type ClipperModalEvent =
+  | { type: "SWITCH_TAB"; tab: "url" | "bookmarklet" }
+  | { type: "START_CLIP"; url: string }
+  | { type: "CLIP_FAILED"; message: string }
+  | { type: "CLEAR_ERROR" };
+
+export const INITIAL_CLIPPER_STATE: ClipperModalState = {
+  tab: "url",
+  job: { status: "idle" },
+};
+
+export function transitionClipper(state: ClipperModalState, event: ClipperModalEvent): ClipperModalState {
+  switch (event.type) {
+    case "SWITCH_TAB":
+      if (state.job.status === "clipping") return state;
+      return { tab: event.tab, job: { status: "idle" } };
+    case "START_CLIP":
+      if (state.job.status === "clipping") return state;
+      return { ...state, job: { status: "clipping", url: event.url } };
+    case "CLIP_FAILED":
+      return { ...state, job: { status: "error", message: event.message } };
+    case "CLEAR_ERROR":
+      return state.job.status === "error" ? { ...state, job: { status: "idle" } } : state;
+  }
+}
+
+/* =========================================================
+ * 10. 全局搜索异步查询与游标状态机（Search Query & Selection Machine）
+ *     消除 hits === null 的“空输入 vs 搜索防抖中”二义性，检索期间保留上一轮结果防闪烁，并严格钳制键盘游标边界
+ * ========================================================= */
+
+export type SearchQueryState =
+  | { phase: "recent"; selectedIndex: number }
+  | { phase: "searching"; query: string; prevHits: SearchHit[]; selectedIndex: number }
+  | { phase: "results"; query: string; hits: SearchHit[]; selectedIndex: number }
+  | { phase: "error"; query: string; message: string };
+
+export type SearchQueryEvent =
+  | { type: "INPUT_CHANGED"; query: string }
+  | { type: "SEARCH_RESOLVED"; query: string; hits: SearchHit[] }
+  | { type: "SEARCH_FAILED"; query: string; message: string }
+  | { type: "MOVE_INDEX"; delta: number; itemCount: number }
+  | { type: "SET_INDEX"; index: number; itemCount: number };
+
+export const INITIAL_SEARCH_STATE: SearchQueryState = {
+  phase: "recent",
+  selectedIndex: 0,
+};
+
+function clampIdx(idx: number, count: number): number {
+  if (count <= 0) return 0;
+  return Math.max(0, Math.min(count - 1, idx));
+}
+
+export function transitionSearchQuery(state: SearchQueryState, event: SearchQueryEvent): SearchQueryState {
+  switch (event.type) {
+    case "INPUT_CHANGED": {
+      const q = event.query.trim();
+      if (!q) return { phase: "recent", selectedIndex: 0 };
+      const prevHits =
+        state.phase === "results"
+          ? state.hits
+          : state.phase === "searching"
+            ? state.prevHits
+            : [];
+      return { phase: "searching", query: q, prevHits, selectedIndex: 0 };
+    }
+    case "SEARCH_RESOLVED":
+      if (state.phase !== "searching" || state.query !== event.query) return state;
+      return { phase: "results", query: event.query, hits: event.hits, selectedIndex: 0 };
+    case "SEARCH_FAILED":
+      if (state.phase !== "searching" || state.query !== event.query) return state;
+      return { phase: "error", query: event.query, message: event.message };
+    case "MOVE_INDEX": {
+      if (state.phase === "error") return state;
+      return { ...state, selectedIndex: clampIdx(state.selectedIndex + event.delta, event.itemCount) };
+    }
+    case "SET_INDEX": {
+      if (state.phase === "error") return state;
+      const next = clampIdx(event.index, event.itemCount);
+      return next === state.selectedIndex ? state : { ...state, selectedIndex: next };
+    }
+  }
+}
+
+/* =========================================================
+ * 11. 数据库表单提交生命周期状态机（Form Submission Machine）
+ *     补齐显式错误态，消除提交异常静默吞没问题
+ * ========================================================= */
+
+export type FormSubmissionState =
+  | { phase: "editing" }
+  | { phase: "submitting" }
+  | { phase: "submitted"; rowId: string }
+  | { phase: "error"; message: string };
+
+export type FormSubmissionEvent =
+  | { type: "SUBMIT_START" }
+  | { type: "SUBMIT_SUCCESS"; rowId: string }
+  | { type: "SUBMIT_ERROR"; message: string }
+  | { type: "RESET" };
+
+export function transitionFormSubmission(
+  state: FormSubmissionState,
+  event: FormSubmissionEvent,
+): FormSubmissionState {
+  switch (event.type) {
+    case "SUBMIT_START":
+      return state.phase === "submitting" ? state : { phase: "submitting" };
+    case "SUBMIT_SUCCESS":
+      return { phase: "submitted", rowId: event.rowId };
+    case "SUBMIT_ERROR":
+      return { phase: "error", message: event.message };
+    case "RESET":
+      return { phase: "editing" };
+  }
+}
+
+/* =========================================================
+ * 12. 封面更换与焦点拖拽状态机（Cover Interaction Machine）
+ *     保证“更换封面浮层”与“纵向焦点拖拽”严格互斥，避免陈旧焦点偏移
+ * ========================================================= */
+
+export type CoverInteractionState =
+  | { mode: "viewing" }
+  | { mode: "picking"; anchor: HTMLElement }
+  | { mode: "repositioning"; draftY: number; dragging: boolean };
+
+export type CoverInteractionEvent =
+  | { type: "TOGGLE_PICKER"; anchor: HTMLElement }
+  | { type: "CLOSE_PICKER" }
+  | { type: "START_REPOSITION"; initialY: number }
+  | { type: "DRAG_START" }
+  | { type: "DRAG_MOVE"; y: number }
+  | { type: "DRAG_END" }
+  | { type: "FINISH_REPOSITION" };
+
+export function transitionCover(
+  state: CoverInteractionState,
+  event: CoverInteractionEvent,
+): CoverInteractionState {
+  switch (event.type) {
+    case "TOGGLE_PICKER":
+      if (state.mode === "repositioning") return state;
+      return state.mode === "picking" ? { mode: "viewing" } : { mode: "picking", anchor: event.anchor };
+    case "CLOSE_PICKER":
+      return state.mode === "picking" ? { mode: "viewing" } : state;
+    case "START_REPOSITION":
+      return {
+        mode: "repositioning",
+        draftY: Math.max(0, Math.min(100, Math.round(event.initialY))),
+        dragging: false,
+      };
+    case "DRAG_START":
+      return state.mode === "repositioning" ? { ...state, dragging: true } : state;
+    case "DRAG_MOVE":
+      return state.mode === "repositioning"
+        ? { ...state, draftY: Math.max(0, Math.min(100, Math.round(event.y))) }
+        : state;
+    case "DRAG_END":
+      return state.mode === "repositioning" ? { ...state, dragging: false } : state;
+    case "FINISH_REPOSITION":
+      return { mode: "viewing" };
+  }
 }

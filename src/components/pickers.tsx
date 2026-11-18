@@ -1,6 +1,6 @@
 import { useRef, type CSSProperties } from "react";
 import { ImageOff, Palette, Shuffle, SmilePlus, Upload, X } from "lucide-react";
-import { uploadFile } from "../store";
+import { reportError, uploadFile } from "../store";
 import { Popover } from "./Popover";
 
 const EMOJI_GROUPS: { name: string; emoji: string[] }[] = [
@@ -152,7 +152,7 @@ export function CoverPicker({ anchor, onPick, onClose }: CoverPickerProps) {
               onPick(await uploadFile(file));
               onClose();
             } catch (err) {
-              window.alert(err instanceof Error ? err.message : "上传失败");
+              reportError(err instanceof Error ? err.message : "上传失败");
             }
           }}
         />

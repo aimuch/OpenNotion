@@ -12,6 +12,7 @@ import {
   ListTree,
   LoaderCircle,
   MousePointerClick,
+  Network,
   Palette,
   Pencil,
   Play,
@@ -20,6 +21,7 @@ import {
 } from "lucide-react";
 import { MathRenderer } from "../math";
 import { MermaidDiagram } from "../mermaidSvg";
+import { DEFAULT_MIND_OUTLINE, MindMapDiagram, type MindLayout, type MindTheme } from "../mindmap";
 import { createPage, navigate, setAiOpen, unfurlLink, uploadFile } from "../store";
 import { EmojiPicker } from "./pickers";
 import { cx } from "./Popover";
@@ -815,5 +817,113 @@ export const createBookmarkBlock = createReactBlockSpec(
         <a href={block.props.url}>{block.props.title || block.props.url}</a>
       </p>
     ),
+  },
+);
+
+/** 交互式思维导图块（Mind Map）：支持左右发散/向右逻辑树切换、3 套配色主题、节点点击增删改折与大纲双视图 */
+export const createMindMapBlock = createReactBlockSpec(
+  {
+    type: "mindmap",
+    propSchema: {
+      outline: { default: DEFAULT_MIND_OUTLINE },
+      layout: { default: "mind" },
+      theme: { default: "rainbow" },
+      mode: { default: "map" },
+    },
+    content: "none",
+  },
+  {
+    render: ({ block, editor }) => {
+      const editable = editor.isEditable;
+      const mode = (editable ? block.props.mode : "map") as "map" | "split" | "outline";
+      const layout = (block.props.layout || "mind") as MindLayout;
+      const theme = (block.props.theme || "rainbow") as MindTheme;
+
+      return (
+        <div className="mermaid-block mindmap-block" contentEditable={false} onKeyDown={(e) => e.stopPropagation()}>
+          {editable && (
+            <div className="mermaid-head">
+              <span className="mermaid-title">
+                <Network size={13} /> 思维导图
+              </span>
+              <div className="mermaid-templates">
+                <button
+                  type="button"
+                  className={cx("text-btn small", layout === "mind" && "active")}
+                  onClick={() => editor.updateBlock(block, { props: { layout: "mind" } })}
+                >
+                  左右发散
+                </button>
+                <button
+                  type="button"
+                  className={cx("text-btn small", layout === "right" && "active")}
+                  onClick={() => editor.updateBlock(block, { props: { layout: "right" } })}
+                >
+                  向右逻辑树
+                </button>
+                <select
+                  className="mindmap-theme-select"
+                  aria-label="导图配色"
+                  value={theme}
+                  onChange={(e) => editor.updateBlock(block, { props: { theme: e.target.value } })}
+                >
+                  <option value="rainbow">彩虹分支</option>
+                  <option value="ocean">深海靛蓝</option>
+                  <option value="forest">松林暖棕</option>
+                </select>
+              </div>
+              <div className="ai-scope-tabs">
+                <button
+                  type="button"
+                  className={cx("ai-scope-tab", mode === "map" && "active")}
+                  onClick={() => editor.updateBlock(block, { props: { mode: "map" } })}
+                >
+                  <Eye size={12} /> 导图
+                </button>
+                <button
+                  type="button"
+                  className={cx("ai-scope-tab", mode === "split" && "active")}
+                  onClick={() => editor.updateBlock(block, { props: { mode: "split" } })}
+                >
+                  <Columns2 size={12} /> 分屏大纲
+                </button>
+                <button
+                  type="button"
+                  className={cx("ai-scope-tab", mode === "outline" && "active")}
+                  onClick={() => editor.updateBlock(block, { props: { mode: "outline" } })}
+                >
+                  <Code2 size={12} /> 大纲
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className={cx("mermaid-body", mode === "split" ? "mode-split" : "mode-preview")}>
+            {(mode === "outline" || mode === "split") && (
+              <textarea
+                className="mermaid-editor"
+                rows={8}
+                spellCheck={false}
+                value={block.props.outline}
+                placeholder={"按 2 空格缩进编写思维导图大纲，例如：\n- 中心主题\n  - 分支一\n    - 子节点"}
+                onChange={(e) => editor.updateBlock(block, { props: { outline: e.target.value } })}
+              />
+            )}
+            {(mode === "map" || mode === "split") && (
+              <div className="mermaid-canvas mindmap-canvas">
+                <MindMapDiagram
+                  outline={block.props.outline}
+                  layout={layout}
+                  theme={theme}
+                  editable={editable}
+                  onChangeOutline={(outline) => editor.updateBlock(block, { props: { outline } })}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    },
+    toExternalHTML: ({ block }) => <pre>{block.props.outline}</pre>,
   },
 );

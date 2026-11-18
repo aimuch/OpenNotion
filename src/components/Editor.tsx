@@ -32,7 +32,9 @@ import {
   Link2,
   ListChecks,
   ListTree,
+  MessageSquarePlus,
   MousePointerClick,
+  Network,
   PanelTop,
   RefreshCw,
   Sigma,
@@ -50,6 +52,7 @@ import {
   createEmbedBlock,
   createEquationBlock,
   createMermaidBlock,
+  createMindMapBlock,
   createTocBlock,
 } from "./blocks";
 import { createColumnsBlock, defaultColumns } from "./ColumnsBlock";
@@ -186,6 +189,7 @@ export const schema = BlockNoteSchema.create({
     toc: createTocBlock(),
     equation: createEquationBlock(),
     mermaid: createMermaidBlock(),
+    mindmap: createMindMapBlock(),
     embed: createEmbedBlock(),
     actionButton: createActionButtonBlock(),
     columns: createColumnsBlock(),
@@ -208,11 +212,13 @@ interface Props {
   onContentSync?: (blocks: unknown[]) => void;
   /** 外部（如空白页“AI 帮我写”）触发打开内联 AI 的计数信号 */
   aiTrigger?: number;
+  /** 选中正文片段后点击“划词批注”时的回调 */
+  onQuoteComment?: (quote: string) => void;
   /** 嵌在别的界面里（同步块、分栏、历史预览）：不提供新建子页面、数据库、同步块的命令 */
   nested?: boolean;
 }
 
-export function Editor({ page, editable, onReady, onDirty, onContentSync, aiTrigger, nested }: Props) {
+export function Editor({ page, editable, onReady, onDirty, onContentSync, aiTrigger, onQuoteComment, nested }: Props) {
   const theme = useResolvedTheme();
   const pageId = page.id;
   // 多列分栏内部的虚拟编辑器使用 __col_ 前缀，只通过 onContentSync 写回外层块，不直接请求后端页面接口
@@ -364,6 +370,17 @@ export function Editor({ page, editable, onReady, onDirty, onContentSync, aiTrig
         },
       };
 
+      const mindmapItem: DefaultReactSuggestionItem = {
+        title: "思维导图（Mind Map）",
+        subtext: "交互式左右发散导图与向右逻辑树，支持节点点击编辑与大纲双视图",
+        aliases: ["mindmap", "mind", "siweidaotu", "daotu", "naotu", "思维导图", "导图", "脑图"],
+        group: "排版与扩展块",
+        icon: <Network size={18} />,
+        onItemClick: () => {
+          insertOrUpdateBlockForSlashMenu(editor, { type: "mindmap" });
+        },
+      };
+
       if (nested) {
         return filterSuggestionItems(
           [
@@ -372,6 +389,7 @@ export function Editor({ page, editable, onReady, onDirty, onContentSync, aiTrig
             equationItem,
             inlineMathItem,
             mermaidItem,
+            mindmapItem,
             bookmarkItem,
           ],
           query,
@@ -518,6 +536,7 @@ export function Editor({ page, editable, onReady, onDirty, onContentSync, aiTrig
           equationItem,
           inlineMathItem,
           mermaidItem,
+          mindmapItem,
           embedItem,
           buttonBlockItem,
           bookmarkItem,
@@ -583,8 +602,20 @@ export function Editor({ page, editable, onReady, onDirty, onContentSync, aiTrig
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => openInlineAi(null)}
           >
-            <Sparkles size={13} /> AI 改写 / 翻译所选内容
+            <Sparkles size={13} /> AI 改写 / 翻译
           </button>
+          {onQuoteComment && (
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                onQuoteComment(selectedSnippet);
+                setSelectedSnippet("");
+              }}
+            >
+              <MessageSquarePlus size={13} /> 划词批注
+            </button>
+          )}
         </div>
       )}
       {aiBar && !nested && (

@@ -1,12 +1,14 @@
-import { useRef, useState, type DragEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useMemo, useRef, useState, type DragEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
   ChevronRight,
   ChevronsLeft,
   Ellipsis,
   FileStack,
   FileText,
+  Hash,
   Layers,
   Plus,
+  Scissors,
   Search,
   Settings,
   Sparkles,
@@ -25,6 +27,7 @@ import {
   navigate,
   openSettings,
   setAiOpen,
+  setClipperOpen,
   setExpanded,
   setSearchOpen,
   setSidebarCollapsed,
@@ -48,10 +51,25 @@ async function newPage(parentId: string | null = null) {
 
 export function Sidebar({ currentId }: { currentId: string | null }) {
   const tree = useTree();
+  const pages = useStore((s) => s.pages);
   const width = useStore((s) => s.sidebarWidth);
   const collapsed = useStore((s) => s.sidebarCollapsed);
   const [rootDrop, setRootDrop] = useState(false);
+  const [activeTag, setActiveTag] = useState<string | null>(null);
   const roots = tree.children.get("") ?? [];
+
+  const tagSummary = useMemo(() => {
+    const counts = new Map<string, PageMeta[]>();
+    for (const p of Object.values(pages)) {
+      if (p.trashed || p.hidden || !p.tags?.length) continue;
+      for (const t of p.tags) {
+        const list = counts.get(t);
+        if (list) list.push(p);
+        else counts.set(t, [p]);
+      }
+    }
+    return [...counts.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0], "zh"));
+  }, [pages]);
 
   const startResize = (e: ReactPointerEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -105,9 +123,44 @@ export function Sidebar({ currentId }: { currentId: string | null }) {
             <span>AI 助手</span>
             <kbd>{modKey}J</kbd>
           </button>
+          <button type="button" className="nav-row" onClick={() => setClipperOpen(true)}>
+            <Scissors size={15} />
+            <span>网页剪藏</span>
+            <kbd>{modKey}⇧C</kbd>
+          </button>
         </div>
 
         <div className="sidebar-scroll">
+          {tagSummary.length > 0 && (
+            <section className="sidebar-section">
+              <div className="section-title">
+                <span className="section-label">
+                  <Hash size={12} /> 标签
+                </span>
+              </div>
+              <div className="sidebar-tag-cloud">
+                {tagSummary.map(([tag, list]) => (
+                  <button
+                    key={tag}
+                    type="button"
+                    className={cx("sidebar-tag-chip", activeTag === tag && "active")}
+                    onClick={() => setActiveTag(activeTag === tag ? null : tag)}
+                  >
+                    <span>#{tag}</span>
+                    <em>{list.length}</em>
+                  </button>
+                ))}
+              </div>
+              {activeTag && (
+                <div className="sidebar-tag-matches">
+                  {(tagSummary.find(([t]) => t === activeTag)?.[1] ?? []).map((p) => (
+                    <TreeNode key={p.id} page={p} depth={0} tree={tree} currentId={currentId} draggable={false} />
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
+
           {tree.favorites.length > 0 && (
             <section className="sidebar-section">
               <div className="section-title">

@@ -23,6 +23,9 @@ import type {
   SearchHit,
 } from "../shared/types.ts";
 import { AiService, unfurlUrl } from "./ai.ts";
+import { exportWorkspaceBackupZip } from "./backup.ts";
+import { clipWebPage } from "./clipper.ts";
+import { McpService } from "./mcp.ts";
 import { notesContent, sampleDatabase, sampleRows, welcomeContent } from "./seed.ts";
 
 const ID_RE = /^[a-f0-9]{16}$/;
@@ -59,6 +62,21 @@ function cleanFont(v: unknown): PageFont {
   return v === "serif" || v === "mono" ? v : "sans";
 }
 
+function cleanTags(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of v) {
+    if (typeof item !== "string") continue;
+    const tag = item.trim().replace(/^#+/, "").slice(0, 40);
+    if (!tag || seen.has(tag)) continue;
+    seen.add(tag);
+    out.push(tag);
+    if (out.length >= 24) break;
+  }
+  return out;
+}
+
 function cleanComments(v: unknown): PageComment[] {
   if (!Array.isArray(v)) return [];
   const out: PageComment[] = [];
@@ -70,6 +88,8 @@ function cleanComments(v: unknown): PageComment[] {
       id: c.id.slice(0, 32),
       author: typeof c.author === "string" && c.author.trim() ? c.author.trim().slice(0, 40) : "我",
       text: c.text.slice(0, 4000),
+      ...(typeof c.quote === "string" && c.quote.trim() ? { quote: c.quote.trim().slice(0, 600) } : {}),
+      ...(typeof c.resolved === "boolean" ? { resolved: c.resolved } : {}),
       createdAt: typeof c.createdAt === "number" ? c.createdAt : Date.now(),
     });
   }
@@ -82,6 +102,7 @@ function normalize(page: PageRecord): PageRecord {
   page.kind = page.kind === "database" ? "database" : "page";
   page.database = page.kind === "database" ? (cleanDatabase(page.database) ?? { properties: [], views: [] }) : null;
   page.props = cleanProps(page.props) ?? {};
+  page.tags = cleanTags(page.tags);
   page.smallText = page.smallText === true;
   page.font = cleanFont(page.font);
   page.locked = page.locked === true;
@@ -92,11 +113,10 @@ function normalize(page: PageRecord): PageRecord {
 }
 
 class HttpError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-  ) {
+  status: number;
+  constructor(status: number, message: string) {
     super(message);
+    this.status = status;
   }
 }
 
@@ -134,6 +154,7 @@ function extractText(node: unknown, out: string[] = []): string[] {
       const p = obj.props as Record<string, unknown>;
       if (typeof p.latex === "string" && p.latex) out.push(p.latex);
       if (typeof p.code === "string" && p.code) out.push(p.code);
+      if (typeof p.outline === "string" && p.outline) out.push(p.outline);
       if (typeof p.colsJson === "string" && p.colsJson) {
         try {
           extractText(JSON.parse(p.colsJson), out);
@@ -333,6 +354,34 @@ class Store {
     return [...this.pages.values()].map(toMeta);
   }
 
+  allRecords(): PageRecord[] {
+    return [...this.pages.values()];
+  }
+
+  findOrNull(id: string): PageRecord | null {
+    return this.pages.get(id) ?? null;
+  }
+
+  /** 无损恢复或覆盖写入备份包中的完整 PageRecord 集合 */
+  async restoreRecords(records: unknown[]): Promise<{ imported: number; updated: number }> {
+    let imported = 0;
+    let updated = 0;
+    for (const item of records) {
+      if (!item || typeof item !== "object") continue;
+      const raw = item as PageRecord;
+      if (!ID_RE.test(String(raw.id ?? ""))) continue;
+      const existed = this.pages.has(raw.id);
+      const normalized = normalize(raw);
+      this.pages.set(normalized.id, normalized);
+      this.text.delete(normalized.id);
+      void this.persist(normalized);
+      if (existed) updated++;
+      else imported++;
+    }
+    await this.settled();
+    return { imported, updated };
+  }
+
   get(id: string): PageRecord {
     const page = this.pages.get(id);
     if (!page) throw new HttpError(404, "页面不存在");
@@ -365,6 +414,7 @@ class Store {
     title?: string;
     icon?: string | null;
     cover?: string | null;
+    tags?: string[];
     content?: unknown[];
     kind?: PageKind;
     database?: DatabaseDef | null;
@@ -384,6 +434,7 @@ class Store {
       title: typeof input.title === "string" ? input.title : "",
       icon: input.icon ?? null,
       cover: input.cover ?? null,
+      tags: cleanTags(input.tags),
       parentId,
       order: sibs.length ? sibs[sibs.length - 1].order + 1 : 0,
       favorite: false,
@@ -422,6 +473,10 @@ class Store {
     if (patch.cover === null || typeof patch.cover === "string") page.cover = patch.cover;
     if (typeof patch.coverY === "number" && Number.isFinite(patch.coverY)) {
       page.coverY = Math.max(0, Math.min(100, Math.round(patch.coverY)));
+    }
+    if (Array.isArray(patch.tags)) {
+      page.tags = cleanTags(patch.tags);
+      this.text.delete(page.id);
     }
     if (typeof patch.favorite === "boolean") page.favorite = patch.favorite;
     if (patch.kind === "page" || patch.kind === "database") page.kind = patch.kind;
@@ -522,11 +577,13 @@ class Store {
       title,
       icon: from.icon,
       cover: from.cover,
+      tags: [...(from.tags ?? [])],
       content: structuredClone(from.content),
       kind: from.kind,
       database: structuredClone(from.database),
       props: structuredClone(from.props),
     });
+    if (typeof from.coverY === "number") copy.coverY = from.coverY;
     copy.fullWidth = from.fullWidth;
     copy.smallText = from.smallText;
     copy.font = from.font;
@@ -577,6 +634,10 @@ class Store {
     target.content = structuredClone(template.content);
     target.icon = target.icon ?? template.icon;
     target.cover = target.cover ?? template.cover;
+    if (typeof template.coverY === "number" && target.coverY === undefined) target.coverY = template.coverY;
+    if ((!target.tags || target.tags.length === 0) && template.tags?.length) {
+      target.tags = [...template.tags];
+    }
     target.fullWidth = template.fullWidth;
     target.smallText = template.smallText;
     target.font = template.font;
@@ -738,7 +799,8 @@ class Store {
       if (p.trashed || p.hidden) continue;
       let body = this.text.get(p.id);
       if (body === undefined) {
-        body = [...extractText(p.content), ...this.propsText(p)].join(" ").replace(/\s+/g, " ");
+        const tagTokens = (p.tags ?? []).flatMap((t) => [t, `#${t}`]);
+        body = [...tagTokens, ...extractText(p.content), ...this.propsText(p)].join(" ").replace(/\s+/g, " ");
         this.text.set(p.id, body);
       }
       const inTitle = p.title.toLowerCase().includes(q);
@@ -961,6 +1023,16 @@ type Next = (err?: unknown) => void;
 export function createApiMiddleware(dataDir: string) {
   const store = new Store(dataDir);
   const ai = new AiService(dataDir);
+  const mcp = new McpService({
+    dataDir,
+    listMetas: () => store.metas(),
+    getPage: (id) => store.findOrNull(id),
+    search: (q) => store.search(q),
+    createPage: (input) => store.create(input),
+    updatePage: (id, patch) => store.update(id, patch as Record<string, unknown>),
+    trashPage: (id) => store.trash(id),
+    flush: () => store.settled(),
+  });
 
   async function serveUpload(name: string, res: ServerResponse) {
     if (!UPLOAD_RE.test(name)) throw new HttpError(404, "文件不存在");
@@ -991,14 +1063,32 @@ export function createApiMiddleware(dataDir: string) {
       return serveUpload(parts[1] ?? "", res);
     }
 
-    // 只接受同源请求，避免其他网站向本地服务发起写操作
+    const [, resource, id, action, sub, verb] = parts;
     const origin = req.headers.origin;
-    if (origin && new URL(origin).host !== req.headers.host) {
+    const isCrossOrigin = Boolean(origin && new URL(origin).host !== req.headers.host);
+    const allowExternalBearer =
+      (resource === "mcp" && !id) || (resource === "clip" && !id);
+
+    if (isCrossOrigin && allowExternalBearer) {
+      res.setHeader("Access-Control-Allow-Origin", origin!);
+      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      if (method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      // 跨站调用（如浏览器书签栏剪藏小工具或外部 Web MCP 客户端）必须携带与本机匹配的密钥口令
+      const cfg = await mcp.ensureConfig();
+      const bearer = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
+      if (!bearer || bearer !== cfg.token) {
+        throw new HttpError(401, "外部剪藏或跨域 MCP 请求缺少有效的安全口令");
+      }
+    } else if (isCrossOrigin) {
       throw new HttpError(403, "跨域请求被拒绝");
     }
     await store.init();
 
-    const [, resource, id, action, sub, verb] = parts;
     const all = () => send(res, 200, { pages: store.metas() });
 
     if (resource === "pages" && !id) {
@@ -1010,6 +1100,7 @@ export function createApiMiddleware(dataDir: string) {
           parentId,
           title: typeof body.title === "string" ? body.title : "",
           icon: typeof body.icon === "string" ? body.icon : null,
+          tags: cleanTags(body.tags),
           kind: body.kind === "database" ? "database" : "page",
           database: cleanDatabase(body.database),
           props: cleanProps(body.props) ?? {},
@@ -1154,6 +1245,101 @@ export function createApiMiddleware(dataDir: string) {
       }
     }
 
+    if (resource === "mcp") {
+      const hostOrigin = `http://${req.headers.host ?? "localhost:5273"}`;
+      if (id === "config") {
+        if (method === "GET") {
+          return send(res, 200, { config: await mcp.getPublicConfig(hostOrigin) });
+        }
+        if (method === "PUT") {
+          const body = await readJson(req);
+          const config = await mcp.updateConfig(
+            {
+              enabled: typeof body.enabled === "boolean" ? body.enabled : undefined,
+              requireToken: typeof body.requireToken === "boolean" ? body.requireToken : undefined,
+              rotateToken: body.rotateToken === true,
+            },
+            hostOrigin,
+          );
+          return send(res, 200, { config });
+        }
+      }
+      if (!id && method === "POST") {
+        const auth = await mcp.verifyHttpAuth(req.headers.authorization);
+        if (!auth.ok) throw new HttpError(auth.status ?? 401, auth.message ?? "未授权");
+        const body = await readJson(req);
+        if (Array.isArray(body)) {
+          const replies = (await Promise.all(body.map((item) => mcp.handleJsonRpc(item)))).filter(Boolean);
+          if (replies.length === 0) {
+            res.writeHead(202);
+            res.end();
+            return;
+          }
+          return send(res, 200, replies);
+        }
+        const reply = await mcp.handleJsonRpc(body);
+        if (!reply) {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        return send(res, 200, reply);
+      }
+    }
+
+    if (resource === "clip" && !id && method === "POST") {
+      const body = await readJson(req);
+      try {
+        const extracted = await clipWebPage({
+          url: typeof body.url === "string" ? body.url : "",
+          title: typeof body.title === "string" ? body.title : undefined,
+          html: typeof body.html === "string" ? body.html : undefined,
+          text: typeof body.text === "string" ? body.text : undefined,
+          tags: Array.isArray(body.tags) ? body.tags.filter((t): t is string => typeof t === "string") : undefined,
+        });
+        const parentId = typeof body.parentId === "string" && ID_RE.test(body.parentId) ? body.parentId : null;
+        const created = store.create({
+          parentId,
+          title: extracted.title,
+          icon: "🔖",
+          tags: extracted.tags,
+          content: extracted.blocks,
+        });
+        await store.settled();
+        return send(res, 201, {
+          id: created.id,
+          title: created.title,
+          siteName: extracted.siteName,
+          blockCount: extracted.blocks.length,
+          pages: store.metas(),
+        });
+      } catch (err) {
+        throw new HttpError(400, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    if (resource === "backup") {
+      if (id === "export" && method === "GET") {
+        await store.settled();
+        const zipBuf = await exportWorkspaceBackupZip(store.allRecords(), store.uploadsDir);
+        const day = new Date().toISOString().slice(0, 10);
+        res.writeHead(200, {
+          "Content-Type": "application/zip",
+          "Content-Length": zipBuf.length,
+          "Content-Disposition": `attachment; filename="OpenNotion-backup-${day}.zip"`,
+          "Cache-Control": "no-store",
+        });
+        res.end(zipBuf);
+        return;
+      }
+      if (id === "restore-records" && method === "POST") {
+        const body = await readJson(req);
+        const records = Array.isArray(body.records) ? body.records : [];
+        const stats = await store.restoreRecords(records);
+        return send(res, 200, { ...stats, pages: store.metas() });
+      }
+    }
+
     if (resource === "storage") {
       if (!id && method === "GET") {
         await store.syncFromDisk();
@@ -1205,6 +1391,7 @@ export function createApiMiddleware(dataDir: string) {
   };
 
   return Object.assign(middleware, {
+    mcp,
     flush: () => store.settled(),
     sync: () => store.syncFromDisk(),
     close: () => store.close(),

@@ -42,15 +42,17 @@ export function HistoryModal({ page, onClose }: { page: PageMeta; onClose: () =>
   const restoring = state.status === "loaded" && state.preview.status === "restoring";
 
   useEffect(() => {
+    if (!restoring) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // 正在恢复版本时拦截全局 Esc，避免半途卸载
         e.stopPropagation();
-        if (!restoring) onClose();
+        e.preventDefault();
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [onClose, restoring]);
+  }, [restoring]);
 
   const restore = async () => {
     if (state.status !== "loaded" || state.preview.status !== "ready") return;

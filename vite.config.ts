@@ -26,4 +26,17 @@ export default defineConfig({
     watch: { ignored: ["**/data/**"] },
   },
   preview: { port: 5273 },
+  build: {
+    chunkSizeWarningLimit: 1100,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/react-dom") || id.includes("node_modules/react/")) return "vendor-react";
+          if (id.includes("node_modules/@mantine/") || id.includes("node_modules/@floating-ui/")) return "vendor-mantine";
+          if (id.includes("node_modules/prosemirror-") || id.includes("node_modules/@tiptap/")) return "vendor-prosemirror";
+          if (id.includes("node_modules/lucide-react")) return "vendor-icons";
+        },
+      },
+    },
+  },
 });
