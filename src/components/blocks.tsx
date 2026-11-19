@@ -18,11 +18,19 @@ import {
   Play,
   Settings2,
   Sigma,
+  Sparkles,
 } from "lucide-react";
+import { blocksPlainText, generateMermaidCode, generateMindMapOutline } from "../ai";
+import {
+  transitionBookmarkBlock,
+  transitionEmbedBlock,
+  useMachine,
+  type BookmarkBlockState,
+} from "../machines";
 import { MathRenderer } from "../math";
 import { MermaidDiagram } from "../mermaidSvg";
 import { DEFAULT_MIND_OUTLINE, MindMapDiagram, type MindLayout, type MindTheme } from "../mindmap";
-import { createPage, navigate, setAiOpen, unfurlLink, uploadFile } from "../store";
+import { createPage, navigate, reportError, setAiOpen, unfurlLink, uploadFile } from "../store";
 import { EmojiPicker } from "./pickers";
 import { cx } from "./Popover";
 
@@ -294,6 +302,27 @@ export const createMermaidBlock = createReactBlockSpec(
     render: ({ block, editor }) => {
       const editable = editor.isEditable;
       const mode = (editable ? block.props.mode : "preview") as "preview" | "split" | "code";
+      const [aiOpen, setAiBarOpen] = useState(false);
+      const [aiPrompt, setAiPrompt] = useState("");
+      const [aiBusy, setAiBusy] = useState(false);
+
+      const runAiDiagram = async () => {
+        if (aiBusy) return;
+        setAiBusy(true);
+        try {
+          const ctx = blocksPlainText(editor.document);
+          const code = await generateMermaidCode(aiPrompt, ctx);
+          if (code) {
+            editor.updateBlock(block, { props: { code } });
+            setAiBarOpen(false);
+            setAiPrompt("");
+          }
+        } catch (err) {
+          reportError(err);
+        } finally {
+          setAiBusy(false);
+        }
+      };
 
       return (
         <div className="mermaid-block" contentEditable={false} onKeyDown={(e) => e.stopPropagation()}>
@@ -313,6 +342,13 @@ export const createMermaidBlock = createReactBlockSpec(
                     {tpl.label}示例
                   </button>
                 ))}
+                <button
+                  type="button"
+                  className={cx("text-btn small ai-tag-btn", aiOpen && "active")}
+                  onClick={() => setAiBarOpen(!aiOpen)}
+                >
+                  <Sparkles size={12} /> AI 生成
+                </button>
               </div>
               <div className="ai-scope-tabs">
                 <button
@@ -337,6 +373,30 @@ export const createMermaidBlock = createReactBlockSpec(
                   <Code2 size={12} /> 代码
                 </button>
               </div>
+            </div>
+          )}
+
+          {editable && aiOpen && (
+            <div className="diagram-ai-bar">
+              <Sparkles size={13} />
+              <input
+                autoFocus
+                disabled={aiBusy}
+                value={aiPrompt}
+                placeholder="输入流程主题（留空则直接根据当前页面正文提炼流程图）…"
+                onChange={(e) => setAiPrompt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (!e.nativeEvent.isComposing && e.key === "Enter") {
+                    e.preventDefault();
+                    void runAiDiagram();
+                  } else if (e.key === "Escape") {
+                    setAiBarOpen(false);
+                  }
+                }}
+              />
+              <button type="button" className="primary-btn small" disabled={aiBusy} onClick={() => void runAiDiagram()}>
+                {aiBusy ? <LoaderCircle size={12} className="spin" /> : "生成图表"}
+              </button>
             </div>
           )}
 
@@ -422,19 +482,23 @@ export const createEmbedBlock = createReactBlockSpec(
   {
     render: ({ block, editor }) => {
       const editable = editor.isEditable;
-      const [editing, setEditing] = useState(!block.props.url);
-      const [draft, setDraft] = useState(block.props.url);
-      const [uploading, setUploading] = useState(false);
-      const [liveH, setLiveH] = useState<number | null>(null);
+      const [embedState, sendEmbed] = useMachine(
+        transitionEmbedBlock,
+        block.props.url ? { phase: "viewing", liveHeight: null } : { phase: "editing", draft: "", error: null },
+      );
       const fileRef = useRef<HTMLInputElement>(null);
 
       const resolved = normalizeEmbedUrl(block.props.url);
+      const draft =
+        embedState.phase === "editing" || embedState.phase === "uploading" ? embedState.draft : block.props.url;
+      const uploading = embedState.phase === "uploading";
+      const uploadErr = embedState.phase === "editing" ? embedState.error : null;
 
       const commit = () => {
         const next = draft.trim();
         if (!next) return;
         editor.updateBlock(block, { props: { url: next } });
-        setEditing(false);
+        sendEmbed({ type: "COMMIT_URL" });
       };
 
       const startResize = (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -446,34 +510,39 @@ export const createEmbedBlock = createReactBlockSpec(
         handle.setPointerCapture(e.pointerId);
         const onMove = (ev: PointerEvent) => {
           curH = Math.max(220, Math.min(860, Math.round(startH + ev.clientY - startY)));
-          setLiveH(curH);
+          sendEmbed({ type: "RESIZE_MOVE", height: curH });
         };
         const onUp = () => {
           handle.removeEventListener("pointermove", onMove);
           handle.removeEventListener("pointerup", onUp);
-          setLiveH(null);
+          sendEmbed({ type: "RESIZE_END" });
           editor.updateBlock(block, { props: { height: curH } });
         };
         handle.addEventListener("pointermove", onMove);
         handle.addEventListener("pointerup", onUp);
       };
 
-      if (editing || !resolved) {
+      if (embedState.phase !== "viewing" || !resolved) {
         return (
-          <div className="bookmark-input-bar" contentEditable={false} onKeyDown={(e) => e.stopPropagation()}>
+          <div
+            className="bookmark-input-bar"
+            contentEditable={false}
+            data-embed-state={embedState.phase}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
             <Globe size={15} />
             <input
               autoFocus={editable}
               disabled={!editable || uploading}
               value={draft}
               placeholder="粘贴 PDF、Bilibili、YouTube、Figma 或任意 https 链接…"
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => sendEmbed({ type: "DRAFT_CHANGE", draft: e.target.value })}
               onKeyDown={(e) => {
                 if (!e.nativeEvent.isComposing && e.key === "Enter") {
                   e.preventDefault();
                   commit();
                 } else if (!e.nativeEvent.isComposing && e.key === "Escape" && resolved) {
-                  setEditing(false);
+                  sendEmbed({ type: "CANCEL_EDIT" });
                 }
               }}
             />
@@ -494,40 +563,46 @@ export const createEmbedBlock = createReactBlockSpec(
                 const file = e.target.files?.[0];
                 e.target.value = "";
                 if (!file) return;
-                setUploading(true);
+                sendEmbed({ type: "UPLOAD_START" });
                 try {
                   const uploadedUrl = await uploadFile(file);
-                  setDraft(uploadedUrl);
                   editor.updateBlock(block, { props: { url: uploadedUrl } });
-                  setEditing(false);
-                } finally {
-                  setUploading(false);
+                  sendEmbed({ type: "UPLOAD_DONE" });
+                } catch (err) {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  sendEmbed({ type: "UPLOAD_FAIL", message: msg });
+                  reportError(err);
                 }
               }}
             />
-            <button type="button" className="primary-btn small" disabled={!draft.trim()} onClick={commit}>
+            <button type="button" className="primary-btn small" disabled={uploading || !draft.trim()} onClick={commit}>
               嵌入预览
             </button>
-            {resolved && (
-              <button type="button" className="text-btn small" onClick={() => setEditing(false)}>
+            {resolved && !uploading && (
+              <button type="button" className="text-btn small" onClick={() => sendEmbed({ type: "CANCEL_EDIT" })}>
                 取消
               </button>
             )}
+            {uploadErr && <span className="value-error bookmark-err">{uploadErr}</span>}
           </div>
         );
       }
 
-      const h = liveH ?? (block.props.height || 420);
+      const h = embedState.liveHeight ?? (block.props.height || 420);
 
       return (
-        <div className="embed-card" contentEditable={false}>
+        <div className="embed-card" contentEditable={false} data-embed-state="viewing">
           <div className="embed-card-head">
             <span className="embed-kind">
               <Globe size={12} /> {resolved.kind}
             </span>
             <div className="embed-actions">
               {editable && (
-                <button type="button" className="text-btn small" onClick={() => setEditing(true)}>
+                <button
+                  type="button"
+                  className="text-btn small"
+                  onClick={() => sendEmbed({ type: "EDIT", draft: block.props.url })}
+                >
                   <Pencil size={12} /> 更换链接
                 </button>
               )}
@@ -682,11 +757,6 @@ export const createActionButtonBlock = createReactBlockSpec(
   },
 );
 
-type BookmarkState =
-  | { phase: "editing"; draft: string; error: string | null }
-  | { phase: "resolving"; draft: string }
-  | { phase: "ready" };
-
 /** 网页书签块（Web Bookmark）：输入网址自动抓取站点标题与简介并渲染为卡片，可随时修改网址 */
 export const createBookmarkBlock = createReactBlockSpec(
   {
@@ -702,11 +772,12 @@ export const createBookmarkBlock = createReactBlockSpec(
   {
     render: ({ block, editor }) => {
       const editable = editor.isEditable;
-      const [bmState, setBmState] = useState<BookmarkState>(() =>
+      const [bmState, sendBm] = useMachine(
+        transitionBookmarkBlock,
         block.props.url ? { phase: "ready" } : { phase: "editing", draft: "", error: null },
       );
 
-      const effective: BookmarkState =
+      const effective: BookmarkBlockState =
         !block.props.url && bmState.phase === "ready" ? { phase: "editing", draft: "", error: null } : bmState;
 
       const submit = async () => {
@@ -714,7 +785,7 @@ export const createBookmarkBlock = createReactBlockSpec(
         let raw = effective.draft.trim();
         if (!raw) return;
         if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
-        setBmState({ phase: "resolving", draft: raw });
+        sendBm({ type: "RESOLVE_START", url: raw });
         try {
           const data = await unfurlLink(raw);
           editor.updateBlock(block, {
@@ -725,12 +796,12 @@ export const createBookmarkBlock = createReactBlockSpec(
               siteName: data.siteName,
             },
           });
-          setBmState({ phase: "ready" });
+          sendBm({ type: "RESOLVE_DONE" });
         } catch (e) {
-          setBmState({
-            phase: "editing",
+          sendBm({
+            type: "RESOLVE_FAIL",
             draft: raw,
-            error: e instanceof Error ? e.message : String(e),
+            message: e instanceof Error ? e.message : String(e),
           });
         }
       };
@@ -751,7 +822,7 @@ export const createBookmarkBlock = createReactBlockSpec(
               disabled={!editable || loading}
               value={effective.draft}
               placeholder="输入或粘贴网址（如 https://example.com），回车生成书签卡片…"
-              onChange={(e) => setBmState({ phase: "editing", draft: e.target.value, error: null })}
+              onChange={(e) => sendBm({ type: "DRAFT_CHANGE", draft: e.target.value })}
               onKeyDown={(e) => {
                 if (e.nativeEvent.isComposing) return;
                 if (e.key === "Enter") {
@@ -759,7 +830,7 @@ export const createBookmarkBlock = createReactBlockSpec(
                   void submit();
                 } else if (e.key === "Escape" && block.props.url) {
                   e.preventDefault();
-                  setBmState({ phase: "ready" });
+                  sendBm({ type: "CANCEL" });
                 }
               }}
             />
@@ -772,7 +843,7 @@ export const createBookmarkBlock = createReactBlockSpec(
               {loading ? <LoaderCircle size={13} className="spin" /> : "嵌入书签"}
             </button>
             {block.props.url && !loading && (
-              <button type="button" className="text-btn small" onClick={() => setBmState({ phase: "ready" })}>
+              <button type="button" className="text-btn small" onClick={() => sendBm({ type: "CANCEL" })}>
                 取消
               </button>
             )}
@@ -804,7 +875,7 @@ export const createBookmarkBlock = createReactBlockSpec(
               className="bookmark-edit-btn"
               title="更换网址"
               aria-label="更换书签网址"
-              onClick={() => setBmState({ phase: "editing", draft: block.props.url, error: null })}
+              onClick={() => sendBm({ type: "EDIT", draft: block.props.url })}
             >
               <Pencil size={12} /> 更换网址
             </button>
@@ -838,6 +909,27 @@ export const createMindMapBlock = createReactBlockSpec(
       const mode = (editable ? block.props.mode : "map") as "map" | "split" | "outline";
       const layout = (block.props.layout || "mind") as MindLayout;
       const theme = (block.props.theme || "rainbow") as MindTheme;
+      const [aiOpen, setAiBarOpen] = useState(false);
+      const [aiPrompt, setAiPrompt] = useState("");
+      const [aiBusy, setAiBusy] = useState(false);
+
+      const runAiMind = async () => {
+        if (aiBusy) return;
+        setAiBusy(true);
+        try {
+          const ctx = blocksPlainText(editor.document);
+          const outline = await generateMindMapOutline(aiPrompt, ctx);
+          if (outline) {
+            editor.updateBlock(block, { props: { outline } });
+            setAiBarOpen(false);
+            setAiPrompt("");
+          }
+        } catch (err) {
+          reportError(err);
+        } finally {
+          setAiBusy(false);
+        }
+      };
 
       return (
         <div className="mermaid-block mindmap-block" contentEditable={false} onKeyDown={(e) => e.stopPropagation()}>
@@ -871,6 +963,13 @@ export const createMindMapBlock = createReactBlockSpec(
                   <option value="ocean">深海靛蓝</option>
                   <option value="forest">松林暖棕</option>
                 </select>
+                <button
+                  type="button"
+                  className={cx("text-btn small ai-tag-btn", aiOpen && "active")}
+                  onClick={() => setAiBarOpen(!aiOpen)}
+                >
+                  <Sparkles size={12} /> AI 生成
+                </button>
               </div>
               <div className="ai-scope-tabs">
                 <button
@@ -895,6 +994,30 @@ export const createMindMapBlock = createReactBlockSpec(
                   <Code2 size={12} /> 大纲
                 </button>
               </div>
+            </div>
+          )}
+
+          {editable && aiOpen && (
+            <div className="diagram-ai-bar">
+              <Sparkles size={13} />
+              <input
+                autoFocus
+                disabled={aiBusy}
+                value={aiPrompt}
+                placeholder="输入导图中心主题（留空则自动按当前页面内容生成结构化思维导图）…"
+                onChange={(e) => setAiPrompt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (!e.nativeEvent.isComposing && e.key === "Enter") {
+                    e.preventDefault();
+                    void runAiMind();
+                  } else if (e.key === "Escape") {
+                    setAiBarOpen(false);
+                  }
+                }}
+              />
+              <button type="button" className="primary-btn small" disabled={aiBusy} onClick={() => void runAiMind()}>
+                {aiBusy ? <LoaderCircle size={12} className="spin" /> : "生成导图"}
+              </button>
             </div>
           )}
 

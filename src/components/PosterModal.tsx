@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
-import { Check, Copy, Download, Printer, Sparkles, X } from "lucide-react";
+import { Check, Copy, Download, ExternalLink, Globe, KeyRound, Printer, RefreshCw, Sparkles, X } from "lucide-react";
 import type { PageMeta } from "../../shared/types";
+import { reportError, updatePageShare } from "../store";
 import { cx } from "./Popover";
 
 export type PosterThemeId = "minimal" | "obsidian" | "magazine" | "emerald" | "aurora" | "kraft";
@@ -122,6 +123,7 @@ export function PosterModal({
   wordCount: number;
   onClose: () => void;
 }) {
+  const [studioTab, setStudioTab] = useState<"poster" | "web">("poster");
   const [themeId, setThemeId] = useState<PosterThemeId>("minimal");
   const [cardWidth, setCardWidth] = useState<440 | 600 | 740>(600);
   const [showDate, setShowDate] = useState(true);
@@ -131,7 +133,24 @@ export function PosterModal({
   const [brandText, setBrandText] = useState("由 OpenNotion 创作与排版");
   const [exporting, setExporting] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [sharePassword, setSharePassword] = useState("");
+  const [linkCopied, setLinkCopied] = useState(false);
   const posterRef = useRef<HTMLDivElement>(null);
+
+  const share = page.share;
+  const shareUrl = share?.enabled ? `${window.location.origin}/s/${share.token}` : "";
+
+  const patchShare = async (input: Parameters<typeof updatePageShare>[1]) => {
+    setShareBusy(true);
+    try {
+      await updatePageShare(page.id, input);
+    } catch (err) {
+      reportError(err);
+    } finally {
+      setShareBusy(false);
+    }
+  };
 
   const theme = POSTER_THEMES.find((t) => t.id === themeId) ?? POSTER_THEMES[0];
   const readMins = Math.max(1, Math.ceil(wordCount / 350));
@@ -211,17 +230,32 @@ export function PosterModal({
   const printPdf = () => {
     const el = posterRef.current;
     if (!el) return;
-    const win = window.open("", "_blank", "width=860,height=900");
-    if (!win) return;
     const safeTitle = (page.title || "打印导出")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
-    win.document.write(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><title>${safeTitle}</title>
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><title>${safeTitle}</title>
       <style>@page { margin: 12mm; } body { margin: 0; display: flex; justify-content: center; background: #fff; -webkit-print-color-adjust: exact; print-color-adjust: exact; }</style>
-      </head><body>${el.outerHTML}<script>window.onload=()=>{setTimeout(()=>{window.print();},150);};</script></body></html>`);
-    win.document.close();
+      </head><body>${el.outerHTML}</body></html>`;
+    // 使用同源隐藏 iframe 触发打印，兼容 Electron 沙箱窗口（不依赖 window.open 弹窗）
+    const iframe = document.createElement("iframe");
+    iframe.style.position = "fixed";
+    iframe.style.right = "0";
+    iframe.style.bottom = "0";
+    iframe.style.width = "0";
+    iframe.style.height = "0";
+    iframe.style.border = "0";
+    iframe.srcdoc = html;
+    iframe.onload = () => {
+      try {
+        iframe.contentWindow?.focus();
+        iframe.contentWindow?.print();
+      } finally {
+        window.setTimeout(() => iframe.remove(), 2000);
+      }
+    };
+    document.body.appendChild(iframe);
   };
 
   return (
@@ -229,16 +263,155 @@ export function PosterModal({
       className="modal-backdrop"
       onMouseDown={(e) => e.target === e.currentTarget && onClose()}
     >
-      <div className="poster-studio" role="dialog" aria-modal="true" aria-label="生成分享海报">
+      <div className="poster-studio" role="dialog" aria-modal="true" aria-label="分享与发布" data-share-tab={studioTab}>
         <aside className="poster-controls">
           <div className="poster-controls-head">
             <strong>
-              <Sparkles size={15} /> 海报与长图分享
+              <Sparkles size={15} /> 分享与发布
             </strong>
             <button type="button" className="icon-btn small" aria-label="关闭" onClick={onClose}>
               <X size={16} />
             </button>
           </div>
+
+          <div className="ai-scope-tabs">
+            <button
+              type="button"
+              className={cx("ai-scope-tab", studioTab === "poster" && "active")}
+              onClick={() => setStudioTab("poster")}
+            >
+              <Sparkles size={12} /> 海报长图
+            </button>
+            <button
+              type="button"
+              className={cx("ai-scope-tab", studioTab === "web" && "active")}
+              onClick={() => setStudioTab("web")}
+            >
+              <Globe size={12} /> 网页分享
+            </button>
+          </div>
+
+          {studioTab === "web" ? (
+            <div className="share-web-panel">
+              <div className="poster-section">
+                <label className="poster-check">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(share?.enabled)}
+                    disabled={shareBusy}
+                    onChange={(e) => void patchShare({ enabled: e.target.checked })}
+                  />
+                  <span>发布为只读分享网页（/s/链接）</span>
+                </label>
+              </div>
+
+              {share?.enabled && (
+                <>
+                  <div className="poster-section">
+                    <span className="poster-label">公开访问链接</span>
+                    <div className="share-link-row">
+                      <input readOnly value={shareUrl} aria-label="公开分享链接" />
+                      <button
+                        type="button"
+                        className="ghost-btn small"
+                        onClick={() => {
+                          void navigator.clipboard?.writeText(shareUrl);
+                          setLinkCopied(true);
+                          window.setTimeout(() => setLinkCopied(false), 1800);
+                        }}
+                      >
+                        {linkCopied ? <Check size={13} /> : <Copy size={13} />}
+                        {linkCopied ? "已复制" : "复制"}
+                      </button>
+                    </div>
+                    <div className="poster-sub-actions" style={{ marginTop: 6 }}>
+                      <a className="ghost-btn small" href={shareUrl} target="_blank" rel="noreferrer noopener">
+                        <ExternalLink size={12} /> 打开预览
+                      </a>
+                      <button
+                        type="button"
+                        className="text-btn small"
+                        disabled={shareBusy}
+                        onClick={() => void patchShare({ rotateToken: true })}
+                      >
+                        <RefreshCw size={12} /> 重置链接
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="poster-section">
+                    <span className="poster-label">
+                      <KeyRound size={12} /> 访问口令保护 {share.hasPassword ? "（已开启）" : "（未设置）"}
+                    </span>
+                    <div className="share-link-row">
+                      <input
+                        type="password"
+                        value={sharePassword}
+                        placeholder={share.hasPassword ? "输入新口令覆盖…" : "可选：设置访问密码…"}
+                        onChange={(e) => setSharePassword(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="primary-btn small"
+                        disabled={shareBusy || !sharePassword.trim()}
+                        onClick={async () => {
+                          await patchShare({ password: sharePassword.trim() });
+                          setSharePassword("");
+                        }}
+                      >
+                        保存
+                      </button>
+                    </div>
+                    {share.hasPassword && (
+                      <button
+                        type="button"
+                        className="text-btn small danger"
+                        style={{ marginTop: 4 }}
+                        disabled={shareBusy}
+                        onClick={() => void patchShare({ password: "__CLEAR__" })}
+                      >
+                        取消密码保护
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="poster-section">
+                    <span className="poster-label">公开页选项</span>
+                    {page.kind === "database" && (
+                      <label className="poster-check">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(share.allowFormSubmit)}
+                          disabled={shareBusy}
+                          onChange={(e) => void patchShare({ allowFormSubmit: e.target.checked })}
+                        />
+                        <span>允许访客提交公开表单写入此数据库</span>
+                      </label>
+                    )}
+                    <label className="poster-check">
+                      <input
+                        type="checkbox"
+                        checked={share.showMeta !== false}
+                        disabled={shareBusy}
+                        onChange={(e) => void patchShare({ showMeta: e.target.checked })}
+                      />
+                      <span>显示更新时间与字数</span>
+                    </label>
+                    <label className="poster-check">
+                      <input
+                        type="checkbox"
+                        checked={share.showBrand !== false}
+                        disabled={shareBusy}
+                        onChange={(e) => void patchShare({ showBrand: e.target.checked })}
+                      />
+                      <span>显示底部品牌标识</span>
+                    </label>
+                  </div>
+                </>
+              )}
+            </div>
+          ) : (
+            <>
 
           <div className="poster-section">
             <span className="poster-label">视觉主题</span>
@@ -319,6 +492,8 @@ export function PosterModal({
               </button>
             </div>
           </div>
+            </>
+          )}
         </aside>
 
         <div className="poster-preview-pane">

@@ -1,19 +1,22 @@
-import { useEffect, useRef } from "react";
-import { CircleAlert, LoaderCircle, PanelLeft, Plus } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { CircleAlert, KeyRound, LoaderCircle, PanelLeft, Plus } from "lucide-react";
 import { AiModal } from "./components/AiModal";
 import { AiSettingsModal } from "./components/AiSettingsModal";
 import { ClipperModal } from "./components/ClipperModal";
 import { Logo } from "./components/Logo";
+import { PublicShareView } from "./components/PublicShareView";
 import { RowDrawer } from "./components/database/RowDrawer";
 import { topOverlayName, transitionImport, useMachine } from "./machines";
-import { importNotionZip } from "./notionImport";
+import { importNotionZip, importNotionZipBuffer, isEncryptedBackupBytes } from "./notionImport";
 import {
   closeSettings,
   createPage,
+  decryptBackupArchive,
   dismissTopOverlay,
   getState,
   loadPages,
   navigate,
+  resizeSplitPane,
   sendOverlay,
   setExpanded,
   setSidebarCollapsed,
@@ -27,10 +30,24 @@ import { Sidebar } from "./components/Sidebar";
 
 const LAST_PAGE_KEY = "on:lastPage";
 
+function getPublicShareToken(): string | null {
+  const m = /^\/s\/([a-f0-9]{16,32})\/?$/.exec(window.location.pathname);
+  return m ? m[1] : null;
+}
+
 export function App() {
+  const publicToken = getPublicShareToken();
+  if (publicToken) {
+    return <PublicShareView token={publicToken} />;
+  }
+  return <WorkspaceApp />;
+}
+
+function WorkspaceApp() {
   const loaded = useStore((s) => s.loaded);
   const pages = useStore((s) => s.pages);
   const overlay = useStore((s) => s.overlay);
+  const splitPane = useStore((s) => s.splitPane);
   const searchOpen = overlay.modal === "search";
   const aiOpen = overlay.modal === "ai";
   const clipperOpen = overlay.modal === "clipper";
@@ -45,15 +62,46 @@ export function App() {
   const current = route && pages[route] ? route : null;
 
   const zipInputRef = useRef<HTMLInputElement>(null);
+  const pendingEncFileRef = useRef<File | null>(null);
+  const [encPassword, setEncPassword] = useState("");
   const [importState, sendImport] = useMachine(transitionImport, { status: "idle" });
 
   const runNotionImport = async (file: File) => {
+    const head = new Uint8Array(await file.slice(0, 64).arrayBuffer());
+    if (file.name.toLowerCase().endsWith(".enc") || isEncryptedBackupBytes(head)) {
+      pendingEncFileRef.current = file;
+      setEncPassword("");
+      sendImport({ type: "NEED_PASSWORD", fileName: file.name });
+      return;
+    }
     sendImport({ type: "START" });
     try {
       const result = await importNotionZip(file, (text) => sendImport({ type: "PROGRESS", text }));
       sendImport({ type: "SUCCEED", result });
     } catch (err) {
       sendImport({ type: "FAIL", message: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  const runEncryptedImport = async () => {
+    const file = pendingEncFileRef.current;
+    if (!file || !encPassword.trim()) return;
+    sendImport({ type: "START", text: "正在解密 AES-256 备份归档…" });
+    try {
+      const zipBytes = await decryptBackupArchive(file, encPassword.trim());
+      const result = await importNotionZipBuffer(zipBytes.slice().buffer, (text) =>
+        sendImport({ type: "PROGRESS", text }),
+      );
+      pendingEncFileRef.current = null;
+      setEncPassword("");
+      sendImport({ type: "SUCCEED", result });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("口令")) {
+        sendImport({ type: "NEED_PASSWORD", fileName: file.name, error: msg });
+      } else {
+        sendImport({ type: "FAIL", message: msg });
+      }
     }
   };
 
@@ -156,9 +204,53 @@ export function App() {
     >
       <Sidebar currentId={current} />
       {!collapsed && <div className="sidebar-backdrop" onClick={() => setSidebarCollapsed(true)} />}
-      <main className="main">
+      <main className={splitPane.open && current ? "main main-split" : "main"}>
         {current ? (
-          <PageView key={`${current}:${revisions[current] ?? 0}`} id={current} />
+          <>
+            <div
+              className="split-pane-primary"
+              style={splitPane.open ? { flexBasis: `${splitPane.ratio * 100}%` } : undefined}
+            >
+              <PageView key={`${current}:${revisions[current] ?? 0}`} id={current} />
+            </div>
+            {splitPane.open && pages[splitPane.pageId] && (
+              <>
+                <div
+                  className="split-resizer"
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="拖动调整分屏宽度"
+                  onPointerDown={(e) => {
+                    const container = e.currentTarget.parentElement;
+                    if (!container) return;
+                    const rect = container.getBoundingClientRect();
+                    const el = e.currentTarget;
+                    el.setPointerCapture(e.pointerId);
+                    const onMove = (ev: PointerEvent) => {
+                      resizeSplitPane((ev.clientX - rect.left) / Math.max(1, rect.width));
+                    };
+                    const onUp = () => {
+                      el.removeEventListener("pointermove", onMove);
+                      el.removeEventListener("pointerup", onUp);
+                    };
+                    el.addEventListener("pointermove", onMove);
+                    el.addEventListener("pointerup", onUp);
+                  }}
+                />
+                <div
+                  className="split-pane-secondary"
+                  style={{ flexBasis: `${(1 - splitPane.ratio) * 100}%` }}
+                  data-split-pane="open"
+                >
+                  <PageView
+                    key={`split:${splitPane.pageId}:${revisions[splitPane.pageId] ?? 0}`}
+                    id={splitPane.pageId}
+                    secondary
+                  />
+                </div>
+              </>
+            )}
+          </>
         ) : (
           <div className="page">
             {collapsed && (
@@ -196,7 +288,7 @@ export function App() {
       <input
         ref={zipInputRef}
         type="file"
-        accept=".zip,application/zip"
+        accept=".zip,application/zip,.enc,.opennotion.enc,.enex,application/xml,text/xml"
         hidden
         onChange={(e) => {
           const file = e.target.files?.[0];
@@ -228,12 +320,55 @@ export function App() {
             data-import-state={importState.status}
           >
             <h2>
-              {importState.status === "done" && importState.result.source === "backup"
-                ? "备份无损还原完成"
-                : importState.status === "done" && importState.result.source === "obsidian"
-                  ? "Obsidian / Markdown 笔记库导入完成"
-                  : "导入笔记与数据库压缩包"}
+              {importState.status === "awaiting_password"
+                ? "输入加密归档解密口令"
+                : importState.status === "done" && importState.result.source === "backup"
+                  ? "备份无损还原完成"
+                  : importState.status === "done" && importState.result.source === "obsidian"
+                    ? "Obsidian / Markdown 笔记库导入完成"
+                    : importState.status === "done" && importState.result.source === "evernote"
+                      ? "印象笔记（.enex）导入完成"
+                      : "导入笔记与数据库归档"}
             </h2>
+            {importState.status === "awaiting_password" && (
+              <form
+                className="import-pwd-form"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void runEncryptedImport();
+                }}
+              >
+                <p>
+                  文件 <code>{importState.fileName}</code> 使用 AES-256-GCM 加密，请输入导出时设置的口令：
+                </p>
+                <div className="share-link-row" style={{ marginTop: 8 }}>
+                  <KeyRound size={15} />
+                  <input
+                    type="password"
+                    autoFocus
+                    value={encPassword}
+                    placeholder="输入备份解密口令…"
+                    onChange={(e) => setEncPassword(e.target.value)}
+                  />
+                </div>
+                {importState.error && <p className="value-error">{importState.error}</p>}
+                <div className="import-actions">
+                  <button
+                    type="button"
+                    className="ghost-btn small"
+                    onClick={() => {
+                      pendingEncFileRef.current = null;
+                      sendImport({ type: "DISMISS" });
+                    }}
+                  >
+                    取消
+                  </button>
+                  <button type="submit" className="primary-btn small" disabled={!encPassword.trim()}>
+                    解密并恢复
+                  </button>
+                </div>
+              </form>
+            )}
             {importState.status === "running" && (
               <p className="import-progress" aria-live="polite">
                 <LoaderCircle size={15} className="spin" /> {importState.text}
@@ -250,7 +385,9 @@ export function App() {
                     ? "所有页面、多维数据库视图、公式与标签已按备份原样无损恢复。"
                     : importState.result.source === "obsidian"
                       ? "目录层级、YAML 标签及 [[双链]] 已自动转换为原生页面树与双向链接。"
-                      : "内容已归入新创建的导入页面下；数据库的列类型已根据内容自动识别。"}
+                      : importState.result.source === "evernote"
+                        ? "印象笔记正文、待办事项、标签及内嵌图片附件已全部转换并保存。"
+                        : "内容已归入新创建的导入页面下；数据库的列类型已根据内容自动识别。"}
                 </p>
                 <div className="import-actions">
                   <button

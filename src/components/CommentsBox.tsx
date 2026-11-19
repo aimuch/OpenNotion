@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { Check, MessageSquare, Send, Trash2, X } from "lucide-react";
+import { Check, CornerDownRight, MessageSquare, Send, Trash2, X } from "lucide-react";
 import type { PageMeta } from "../../shared/types";
 import { shortId } from "../db";
+import { transitionCommentsBox, useMachine } from "../machines";
 import { updatePage } from "../store";
 import { cx } from "./Popover";
 
@@ -20,20 +21,24 @@ export function CommentsBox({
 }) {
   const comments = page.comments ?? [];
   const [text, setText] = useState("");
-  const [composing, setComposing] = useState(Boolean(openComposer || pendingQuote));
+  const [replyText, setReplyText] = useState("");
+  const [boxState, sendBox] = useMachine(
+    transitionCommentsBox,
+    openComposer || pendingQuote ? { mode: "composing" } : { mode: "idle" },
+  );
   const editable = !page.trashed && !page.locked;
 
   useEffect(() => {
-    if (openComposer || pendingQuote) setComposing(true);
-  }, [openComposer, pendingQuote]);
+    if (openComposer || pendingQuote) sendBox({ type: "OPEN_COMPOSER" });
+  }, [openComposer, pendingQuote, sendBox]);
 
   const closeComposer = () => {
-    setComposing(false);
+    sendBox({ type: "CLOSE" });
     onClearQuote?.();
     onCloseComposer?.();
   };
 
-  if (comments.length === 0 && !composing) return null;
+  if (comments.length === 0 && boxState.mode === "idle") return null;
 
   const submit = () => {
     const trimmed = text.trim();
@@ -54,8 +59,28 @@ export function CommentsBox({
     closeComposer();
   };
 
+  const submitReply = (commentId: string) => {
+    const trimmed = replyText.trim();
+    if (!trimmed) return;
+    updatePage(page.id, {
+      comments: comments.map((c) =>
+        c.id === commentId
+          ? {
+              ...c,
+              replies: [
+                ...(c.replies ?? []),
+                { id: shortId(), author: "我", text: trimmed, createdAt: Date.now() },
+              ],
+            }
+          : c,
+      ),
+    });
+    setReplyText("");
+    sendBox({ type: "CLOSE" });
+  };
+
   return (
-    <section className="page-comments" aria-label="页面批注" data-comments-state={composing ? "composing" : "idle"}>
+    <section className="page-comments" aria-label="页面批注" data-comments-state={boxState.mode}>
       {comments.map((c) => (
         <div key={c.id} className={cx("comment-row", c.resolved && "resolved")}>
           <span className="comment-avatar">{c.author.slice(0, 1)}</span>
@@ -74,9 +99,68 @@ export function CommentsBox({
             </div>
             {c.quote && <blockquote className="comment-quote">“{c.quote}”</blockquote>}
             <div className="comment-text">{c.text}</div>
+
+            {c.replies && c.replies.length > 0 && (
+              <div className="comment-replies">
+                {c.replies.map((r) => (
+                  <div key={r.id} className="comment-reply-item">
+                    <span className="comment-reply-author">{r.author}</span>
+                    <span className="comment-reply-text">{r.text}</span>
+                    <span className="comment-reply-time">
+                      {new Date(r.createdAt).toLocaleString("zh-CN", {
+                        month: "numeric",
+                        day: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {editable && boxState.mode === "replying" && boxState.commentId === c.id && (
+              <form
+                className="comment-form comment-reply-form"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  submitReply(c.id);
+                }}
+              >
+                <CornerDownRight size={13} />
+                <input
+                  autoFocus
+                  value={replyText}
+                  placeholder="回复这条批注…（回车发送）"
+                  onChange={(e) => setReplyText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (!e.nativeEvent.isComposing && e.key === "Escape") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      sendBox({ type: "CLOSE" });
+                    }
+                  }}
+                />
+                <button type="submit" className="primary-btn small" disabled={!replyText.trim()}>
+                  回复
+                </button>
+              </form>
+            )}
           </div>
           {editable && (
             <div className="comment-actions">
+              <button
+                type="button"
+                className="icon-btn small"
+                title="回复批注"
+                aria-label="回复批注"
+                onClick={() => {
+                  setReplyText("");
+                  sendBox({ type: "OPEN_REPLY", commentId: c.id });
+                }}
+              >
+                <CornerDownRight size={13} />
+              </button>
               <button
                 type="button"
                 className="icon-btn small"
@@ -103,7 +187,7 @@ export function CommentsBox({
           )}
         </div>
       ))}
-      {editable && composing ? (
+      {editable && boxState.mode === "composing" ? (
         <div className="comment-composer-wrap">
           {pendingQuote && (
             <div className="comment-pending-quote">
@@ -142,7 +226,11 @@ export function CommentsBox({
       ) : (
         editable &&
         comments.length > 0 && (
-          <button type="button" className="text-btn small comment-more" onClick={() => setComposing(true)}>
+          <button
+            type="button"
+            className="text-btn small comment-more"
+            onClick={() => sendBox({ type: "OPEN_COMPOSER" })}
+          >
             <MessageSquare size={13} /> 继续添加批注
           </button>
         )

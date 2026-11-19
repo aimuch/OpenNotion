@@ -6,7 +6,7 @@
  * 同时为界面提供统一的 data-* 状态标记与只读诊断快照。
  */
 import { useCallback, useReducer } from "react";
-import type { AiChatMessage, AiCitation, HistoryEntry, PageRecord, SearchHit } from "../shared/types";
+import type { AiChatMessage, AiCitation, HistoryEntry, PageMeta, PageRecord, SearchHit } from "../shared/types";
 import type { ImportResult } from "./notionImport";
 
 /** 轻量状态机 Hook：用纯 reducer 驱动显式事件转移 */
@@ -319,12 +319,14 @@ export function transitionHistory(state: HistoryModalState, event: HistoryModalE
 
 export type ImportModalState =
   | { status: "idle" }
+  | { status: "awaiting_password"; fileName: string; error: string | null }
   | { status: "running"; text: string }
   | { status: "done"; result: ImportResult }
   | { status: "error"; message: string };
 
 export type ImportModalEvent =
-  | { type: "START" }
+  | { type: "NEED_PASSWORD"; fileName: string; error?: string | null }
+  | { type: "START"; text?: string }
   | { type: "PROGRESS"; text: string }
   | { type: "SUCCEED"; result: ImportResult }
   | { type: "FAIL"; message: string }
@@ -332,8 +334,12 @@ export type ImportModalEvent =
 
 export function transitionImport(state: ImportModalState, event: ImportModalEvent): ImportModalState {
   switch (event.type) {
+    case "NEED_PASSWORD":
+      return { status: "awaiting_password", fileName: event.fileName, error: event.error ?? null };
     case "START":
-      return state.status === "running" ? state : { status: "running", text: "正在读取压缩包…" };
+      return state.status === "running"
+        ? state
+        : { status: "running", text: event.text ?? "正在读取导入文件…" };
     case "PROGRESS":
       return state.status === "running" ? { status: "running", text: event.text } : state;
     case "SUCCEED":
@@ -666,5 +672,312 @@ export function transitionCover(
       return state.mode === "repositioning" ? { ...state, dragging: false } : state;
     case "FINISH_REPOSITION":
       return { mode: "viewing" };
+  }
+}
+
+/* =========================================================
+ * 13. 设置面板异步操作互斥状态机（Settings Async Operation Machine）
+ *     消除 saving / testing / fetchingModels / backingUp 等多布尔重叠竞态
+ * ========================================================= */
+
+export interface SettingsAsyncState {
+  phase: "idle" | "busy";
+  job: string | null;
+  notice: { ok: boolean; text: string } | null;
+}
+
+export type SettingsAsyncEvent =
+  | { type: "BEGIN"; job: string }
+  | { type: "SUCCEED"; text?: string }
+  | { type: "FAIL"; text: string }
+  | { type: "CLEAR_NOTICE" };
+
+export const INITIAL_SETTINGS_ASYNC_STATE: SettingsAsyncState = {
+  phase: "idle",
+  job: null,
+  notice: null,
+};
+
+export function transitionSettingsAsync(
+  state: SettingsAsyncState,
+  event: SettingsAsyncEvent,
+): SettingsAsyncState {
+  switch (event.type) {
+    case "BEGIN":
+      if (state.phase === "busy") return state;
+      return { phase: "busy", job: event.job, notice: null };
+    case "SUCCEED":
+      return {
+        phase: "idle",
+        job: null,
+        notice: event.text ? { ok: true, text: event.text } : null,
+      };
+    case "FAIL":
+      return {
+        phase: "idle",
+        job: null,
+        notice: { ok: false, text: event.text },
+      };
+    case "CLEAR_NOTICE":
+      return state.notice ? { ...state, notice: null } : state;
+  }
+}
+
+/* =========================================================
+ * 14. 非阻塞二次确认动作状态机（Inline Two-Step Confirm Machine）
+ *     彻底替代原生 window.confirm，不阻塞主线程也不挂起自动化 Agent
+ * ========================================================= */
+
+export type ConfirmActionState =
+  | { status: "idle" }
+  | { status: "confirming"; targetKey: string }
+  | { status: "executing"; targetKey: string };
+
+export type ConfirmActionEvent =
+  | { type: "REQUEST"; targetKey: string }
+  | { type: "CANCEL" }
+  | { type: "EXECUTE"; targetKey: string }
+  | { type: "DONE" };
+
+export function transitionConfirmAction(
+  state: ConfirmActionState,
+  event: ConfirmActionEvent,
+): ConfirmActionState {
+  switch (event.type) {
+    case "REQUEST":
+      if (state.status === "executing") return state;
+      return state.status === "confirming" && state.targetKey === event.targetKey
+        ? { status: "idle" }
+        : { status: "confirming", targetKey: event.targetKey };
+    case "CANCEL":
+      return state.status === "confirming" ? { status: "idle" } : state;
+    case "EXECUTE":
+      return state.status === "confirming" && state.targetKey === event.targetKey
+        ? { status: "executing", targetKey: event.targetKey }
+        : state;
+    case "DONE":
+      return { status: "idle" };
+  }
+}
+
+/* =========================================================
+ * 15. 同步块加载与存活状态机（Synced Block Lifecycle Machine）
+ *     修复切换 sourceId 时旧 failed 标记残留卡死问题
+ * ========================================================= */
+
+export type SyncedBlockState =
+  | { status: "loading"; sourceId: string }
+  | { status: "ready"; sourceId: string; record: PageRecord }
+  | { status: "missing"; sourceId: string };
+
+export type SyncedBlockEvent =
+  | { type: "SWITCH_SOURCE"; sourceId: string }
+  | { type: "LOADED"; sourceId: string; record: PageRecord }
+  | { type: "FAILED"; sourceId: string };
+
+export function transitionSyncedBlock(
+  state: SyncedBlockState,
+  event: SyncedBlockEvent,
+): SyncedBlockState {
+  switch (event.type) {
+    case "SWITCH_SOURCE":
+      return { status: "loading", sourceId: event.sourceId };
+    case "LOADED":
+      if (state.sourceId !== event.sourceId) return state;
+      return { status: "ready", sourceId: event.sourceId, record: event.record };
+    case "FAILED":
+      if (state.sourceId !== event.sourceId) return state;
+      return { status: "missing", sourceId: event.sourceId };
+  }
+}
+
+/* =========================================================
+ * 16. 媒体内嵌与书签解析块状态机（Embed & Bookmark Block Machines）
+ *     显式捕获本地 PDF 上传异常与拖拽调高互斥态
+ * ========================================================= */
+
+export type EmbedBlockState =
+  | { phase: "editing"; draft: string; error: string | null }
+  | { phase: "uploading"; draft: string }
+  | { phase: "viewing"; liveHeight: number | null };
+
+export type EmbedBlockEvent =
+  | { type: "EDIT"; draft: string }
+  | { type: "DRAFT_CHANGE"; draft: string }
+  | { type: "CANCEL_EDIT" }
+  | { type: "COMMIT_URL" }
+  | { type: "UPLOAD_START" }
+  | { type: "UPLOAD_DONE" }
+  | { type: "UPLOAD_FAIL"; message: string }
+  | { type: "RESIZE_MOVE"; height: number }
+  | { type: "RESIZE_END" };
+
+export function transitionEmbedBlock(
+  state: EmbedBlockState,
+  event: EmbedBlockEvent,
+): EmbedBlockState {
+  switch (event.type) {
+    case "EDIT":
+      return state.phase === "uploading" ? state : { phase: "editing", draft: event.draft, error: null };
+    case "DRAFT_CHANGE":
+      return state.phase === "editing" ? { phase: "editing", draft: event.draft, error: null } : state;
+    case "CANCEL_EDIT":
+    case "COMMIT_URL":
+      return state.phase === "uploading" ? state : { phase: "viewing", liveHeight: null };
+    case "UPLOAD_START":
+      return { phase: "uploading", draft: state.phase === "editing" ? state.draft : "" };
+    case "UPLOAD_DONE":
+      return { phase: "viewing", liveHeight: null };
+    case "UPLOAD_FAIL":
+      return {
+        phase: "editing",
+        draft: state.phase === "uploading" ? state.draft : "",
+        error: event.message,
+      };
+    case "RESIZE_MOVE":
+      return state.phase === "viewing"
+        ? { phase: "viewing", liveHeight: Math.max(220, Math.min(860, Math.round(event.height))) }
+        : state;
+    case "RESIZE_END":
+      return state.phase === "viewing" ? { phase: "viewing", liveHeight: null } : state;
+  }
+}
+
+export type BookmarkBlockState =
+  | { phase: "editing"; draft: string; error: string | null }
+  | { phase: "resolving"; draft: string }
+  | { phase: "ready" };
+
+export type BookmarkBlockEvent =
+  | { type: "EDIT"; draft: string }
+  | { type: "DRAFT_CHANGE"; draft: string }
+  | { type: "CANCEL" }
+  | { type: "RESOLVE_START"; url: string }
+  | { type: "RESOLVE_DONE" }
+  | { type: "RESOLVE_FAIL"; draft: string; message: string };
+
+export function transitionBookmarkBlock(
+  state: BookmarkBlockState,
+  event: BookmarkBlockEvent,
+): BookmarkBlockState {
+  switch (event.type) {
+    case "EDIT":
+      return state.phase === "resolving" ? state : { phase: "editing", draft: event.draft, error: null };
+    case "DRAFT_CHANGE":
+      return state.phase === "editing" ? { phase: "editing", draft: event.draft, error: null } : state;
+    case "CANCEL":
+    case "RESOLVE_DONE":
+      return { phase: "ready" };
+    case "RESOLVE_START":
+      return state.phase === "resolving" ? state : { phase: "resolving", draft: event.url };
+    case "RESOLVE_FAIL":
+      return { phase: "editing", draft: event.draft, error: event.message };
+  }
+}
+
+/* =========================================================
+ * 17. 页面划词批注与多轮回复讨论串状态机（Comments Thread Machine）
+ * ========================================================= */
+
+export type CommentsBoxState =
+  | { mode: "idle" }
+  | { mode: "composing" }
+  | { mode: "replying"; commentId: string };
+
+export type CommentsBoxEvent =
+  | { type: "OPEN_COMPOSER" }
+  | { type: "OPEN_REPLY"; commentId: string }
+  | { type: "CLOSE" };
+
+export function transitionCommentsBox(
+  state: CommentsBoxState,
+  event: CommentsBoxEvent,
+): CommentsBoxState {
+  switch (event.type) {
+    case "OPEN_COMPOSER":
+      return { mode: "composing" };
+    case "OPEN_REPLY":
+      return state.mode === "replying" && state.commentId === event.commentId
+        ? { mode: "idle" }
+        : { mode: "replying", commentId: event.commentId };
+    case "CLOSE":
+      return { mode: "idle" };
+  }
+}
+
+/* =========================================================
+ * 18. 双栏并排分屏对照状态机（Split Pane Dual-View Machine）
+ *     当副屏关联页面被删除或移入回收站时自动收起，防止悬挂引用
+ * ========================================================= */
+
+export type SplitPaneState =
+  | { open: false }
+  | { open: true; pageId: string; ratio: number };
+
+export type SplitPaneEvent =
+  | { type: "OPEN"; pageId: string }
+  | { type: "CLOSE" }
+  | { type: "RESIZE"; ratio: number }
+  | { type: "RECONCILE"; validIds: ReadonlySet<string> };
+
+export function transitionSplitPane(state: SplitPaneState, event: SplitPaneEvent): SplitPaneState {
+  switch (event.type) {
+    case "OPEN":
+      return {
+        open: true,
+        pageId: event.pageId,
+        ratio: state.open ? state.ratio : 0.5,
+      };
+    case "CLOSE":
+      return state.open ? { open: false } : state;
+    case "RESIZE":
+      return state.open
+        ? { ...state, ratio: Math.max(0.28, Math.min(0.72, Number(event.ratio.toFixed(3)))) }
+        : state;
+    case "RECONCILE":
+      return state.open && !event.validIds.has(state.pageId) ? { open: false } : state;
+  }
+}
+
+/* =========================================================
+ * 19. 公开分享阅读与口令解锁状态机（Public Share Viewer Machine）
+ * ========================================================= */
+
+export type PublicShareViewState =
+  | { phase: "loading" }
+  | { phase: "locked"; title: string; icon: string | null; unlocking: boolean; error: string | null }
+  | { phase: "ready"; page: PageRecord; rows: PageMeta[]; verifiedPassword: string }
+  | { phase: "not_found"; message: string };
+
+export type PublicShareViewEvent =
+  | { type: "REQUIRE_PASSWORD"; title: string; icon: string | null; error?: string | null }
+  | { type: "UNLOCK_START" }
+  | { type: "LOADED"; page: PageRecord; rows: PageMeta[]; verifiedPassword?: string }
+  | { type: "NOT_FOUND"; message: string };
+
+export function transitionPublicShare(
+  state: PublicShareViewState,
+  event: PublicShareViewEvent,
+): PublicShareViewState {
+  switch (event.type) {
+    case "REQUIRE_PASSWORD":
+      return {
+        phase: "locked",
+        title: event.title,
+        icon: event.icon,
+        unlocking: false,
+        error: event.error ?? null,
+      };
+    case "UNLOCK_START":
+      return state.phase === "locked" ? { ...state, unlocking: true, error: null } : state;
+    case "LOADED":
+      return {
+        phase: "ready",
+        page: event.page,
+        rows: event.rows,
+        verifiedPassword: event.verifiedPassword ?? "",
+      };
+    case "NOT_FOUND":
+      return { phase: "not_found", message: event.message };
   }
 }

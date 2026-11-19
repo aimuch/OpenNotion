@@ -12,18 +12,27 @@ import type {
   AiCitation,
   AiConfigUpdate,
   AiProtocol,
+  BackupConfigUpdate,
   DatabaseDef,
   HistoryEntry,
   PageComment,
+  PageCommentReply,
   PageFont,
   PageKind,
   PageMeta,
   PageRecord,
+  PageShareConfig,
   PropValue,
   SearchHit,
+  ShareUpdateInput,
 } from "../shared/types.ts";
 import { AiService, unfurlUrl } from "./ai.ts";
-import { exportWorkspaceBackupZip } from "./backup.ts";
+import {
+  BackupService,
+  decryptBackupBuffer,
+  encryptBackupBuffer,
+  exportWorkspaceBackupZip,
+} from "./backup.ts";
 import { clipWebPage } from "./clipper.ts";
 import { McpService } from "./mcp.ts";
 import { notesContent, sampleDatabase, sampleRows, welcomeContent } from "./seed.ts";
@@ -77,6 +86,38 @@ function cleanTags(v: unknown): string[] {
   return out;
 }
 
+interface StoredShareConfig {
+  enabled: boolean;
+  token: string;
+  allowFormSubmit?: boolean;
+  showMeta?: boolean;
+  showBrand?: boolean;
+  passwordSalt?: string;
+  passwordHash?: string;
+}
+
+type StoredPageRecord = Omit<PageRecord, "share"> & {
+  share?: StoredShareConfig;
+};
+
+function cleanReplies(v: unknown): PageCommentReply[] {
+  if (!Array.isArray(v)) return [];
+  const out: PageCommentReply[] = [];
+  for (const item of v) {
+    if (!item || typeof item !== "object") continue;
+    const r = item as Partial<PageCommentReply>;
+    if (typeof r.id !== "string" || typeof r.text !== "string" || !r.text.trim()) continue;
+    out.push({
+      id: r.id.slice(0, 32),
+      author: typeof r.author === "string" && r.author.trim() ? r.author.trim().slice(0, 40) : "我",
+      text: r.text.slice(0, 2000),
+      createdAt: typeof r.createdAt === "number" ? r.createdAt : Date.now(),
+    });
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
 function cleanComments(v: unknown): PageComment[] {
   if (!Array.isArray(v)) return [];
   const out: PageComment[] = [];
@@ -84,25 +125,56 @@ function cleanComments(v: unknown): PageComment[] {
     if (!item || typeof item !== "object") continue;
     const c = item as Partial<PageComment>;
     if (typeof c.id !== "string" || typeof c.text !== "string" || !c.text.trim()) continue;
+    const replies = cleanReplies(c.replies);
     out.push({
       id: c.id.slice(0, 32),
       author: typeof c.author === "string" && c.author.trim() ? c.author.trim().slice(0, 40) : "我",
       text: c.text.slice(0, 4000),
       ...(typeof c.quote === "string" && c.quote.trim() ? { quote: c.quote.trim().slice(0, 600) } : {}),
       ...(typeof c.resolved === "boolean" ? { resolved: c.resolved } : {}),
+      ...(replies.length > 0 ? { replies } : {}),
       createdAt: typeof c.createdAt === "number" ? c.createdAt : Date.now(),
     });
   }
   return out;
 }
 
+function cleanShare(v: unknown): StoredShareConfig | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const s = v as Partial<StoredShareConfig>;
+  if (typeof s.token !== "string" || !/^[a-f0-9]{16,32}$/.test(s.token)) return undefined;
+  return {
+    enabled: Boolean(s.enabled),
+    token: s.token,
+    allowFormSubmit: Boolean(s.allowFormSubmit),
+    showMeta: s.showMeta !== false,
+    showBrand: s.showBrand !== false,
+    ...(typeof s.passwordSalt === "string" && typeof s.passwordHash === "string" && s.passwordHash
+      ? { passwordSalt: s.passwordSalt, passwordHash: s.passwordHash }
+      : {}),
+  };
+}
+
+function toPublicShare(s?: StoredShareConfig): PageShareConfig | undefined {
+  if (!s) return undefined;
+  return {
+    enabled: s.enabled,
+    token: s.token,
+    hasPassword: Boolean(s.passwordHash),
+    allowFormSubmit: Boolean(s.allowFormSubmit),
+    showMeta: s.showMeta !== false,
+    showBrand: s.showBrand !== false,
+  };
+}
+
 /** 把从磁盘读到的页面补全成当前版本的结构（兼容旧文件） */
-function normalize(page: PageRecord): PageRecord {
+function normalize(page: StoredPageRecord): StoredPageRecord {
   page.content = Array.isArray(page.content) ? page.content : [];
   page.kind = page.kind === "database" ? "database" : "page";
   page.database = page.kind === "database" ? (cleanDatabase(page.database) ?? { properties: [], views: [] }) : null;
   page.props = cleanProps(page.props) ?? {};
   page.tags = cleanTags(page.tags);
+  page.share = cleanShare(page.share);
   page.smallText = page.smallText === true;
   page.font = cleanFont(page.font);
   page.locked = page.locked === true;
@@ -138,9 +210,16 @@ function cleanProps(v: unknown): Record<string, PropValue> | null {
   return v as Record<string, PropValue>;
 }
 
-function toMeta(p: PageRecord): PageMeta {
-  const { content: _content, ...meta } = p;
-  return meta;
+function toPublicRecord(p: StoredPageRecord): PageRecord {
+  const { share, ...rest } = p;
+  const pubShare = toPublicShare(share);
+  return pubShare ? { ...rest, share: pubShare } : rest;
+}
+
+function toMeta(p: StoredPageRecord): PageMeta {
+  const { content: _content, share, ...meta } = p;
+  const pubShare = toPublicShare(share);
+  return pubShare ? { ...meta, share: pubShare } : meta;
 }
 
 /** 从 BlockNote 文档里抽出纯文本，用于搜索。 */
@@ -175,7 +254,7 @@ function extractText(node: unknown, out: string[] = []): string[] {
 }
 
 class Store {
-  private pages = new Map<string, PageRecord>();
+  private pages = new Map<string, StoredPageRecord>();
   private text = new Map<string, string>();
   private writes = new Map<string, Promise<void>>();
   private activeWrites = new Set<string>();
@@ -185,6 +264,7 @@ class Store {
   private ready: Promise<void> | null = null;
   /** 页面 id → 上一次保存历史版本的时间 */
   private lastSnapshot = new Map<string, number>();
+  onChange?: (ids: string[]) => void;
   readonly pagesDir: string;
   readonly uploadsDir: string;
   readonly historyDir: string;
@@ -209,7 +289,7 @@ class Store {
       try {
         const fullPath = path.join(this.pagesDir, f);
         const [raw, st] = await Promise.all([fs.readFile(fullPath, "utf8"), fs.stat(fullPath)]);
-        const page = JSON.parse(raw) as PageRecord;
+        const page = JSON.parse(raw) as StoredPageRecord;
         if (!ID_RE.test(page.id) || `${page.id}.json` !== f) continue;
         this.pages.set(page.id, normalize(page));
         this.fileMtimes.set(page.id, st.mtimeMs);
@@ -266,7 +346,7 @@ class Store {
       if (this.fileMtimes.get(id) === st.mtimeMs && this.pages.has(id)) continue;
       try {
         const raw = await fs.readFile(fullPath, "utf8");
-        const page = JSON.parse(raw) as PageRecord;
+        const page = JSON.parse(raw) as StoredPageRecord;
         if (page.id !== id) continue;
         this.pages.set(id, normalize(page));
         this.fileMtimes.set(id, st.mtimeMs);
@@ -287,7 +367,9 @@ class Store {
       }
     }
 
-    return { changed: updatedIds.length > 0 || removedIds.length > 0, updatedIds, removedIds };
+    const changed = updatedIds.length > 0 || removedIds.length > 0;
+    if (changed) this.onChange?.([...updatedIds, ...removedIds]);
+    return { changed, updatedIds, removedIds };
   }
 
   close() {
@@ -304,10 +386,11 @@ class Store {
     await Promise.all(this.writes.values());
   }
 
-  private persist(page: PageRecord) {
+  private persist(page: StoredPageRecord) {
     // 数据库的选项改名会影响所有行的搜索文本
     if (page.kind === "database") this.text.clear();
     else this.text.delete(page.id);
+    this.onChange?.([page.id]);
     const file = path.join(this.pagesDir, `${page.id}.json`);
     const data = JSON.stringify(page, null, 2);
     const prev = this.writes.get(page.id) ?? Promise.resolve();
@@ -332,6 +415,7 @@ class Store {
   private unlink(id: string) {
     this.text.delete(id);
     this.fileMtimes.delete(id);
+    this.onChange?.([id]);
     const file = path.join(this.pagesDir, `${id}.json`);
     const prev = this.writes.get(id) ?? Promise.resolve();
     this.activeWrites.add(id);
@@ -355,11 +439,12 @@ class Store {
   }
 
   allRecords(): PageRecord[] {
-    return [...this.pages.values()];
+    return [...this.pages.values()].map(toPublicRecord);
   }
 
   findOrNull(id: string): PageRecord | null {
-    return this.pages.get(id) ?? null;
+    const p = this.pages.get(id);
+    return p ? toPublicRecord(p) : null;
   }
 
   /** 无损恢复或覆盖写入备份包中的完整 PageRecord 集合 */
@@ -368,7 +453,7 @@ class Store {
     let updated = 0;
     for (const item of records) {
       if (!item || typeof item !== "object") continue;
-      const raw = item as PageRecord;
+      const raw = item as StoredPageRecord;
       if (!ID_RE.test(String(raw.id ?? ""))) continue;
       const existed = this.pages.has(raw.id);
       const normalized = normalize(raw);
@@ -382,20 +467,24 @@ class Store {
     return { imported, updated };
   }
 
-  get(id: string): PageRecord {
+  get(id: string): StoredPageRecord {
     const page = this.pages.get(id);
     if (!page) throw new HttpError(404, "页面不存在");
     return page;
   }
 
-  private siblings(parentId: string | null, excludeId?: string): PageRecord[] {
+  getPublic(id: string): PageRecord {
+    return toPublicRecord(this.get(id));
+  }
+
+  private siblings(parentId: string | null, excludeId?: string): StoredPageRecord[] {
     return [...this.pages.values()]
       .filter((p) => p.parentId === parentId && !p.trashed && p.id !== excludeId)
       .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
   }
 
-  private descendants(id: string): PageRecord[] {
-    const out: PageRecord[] = [];
+  private descendants(id: string): StoredPageRecord[] {
+    const out: StoredPageRecord[] = [];
     const stack = [id];
     while (stack.length) {
       const cur = stack.pop()!;
@@ -429,7 +518,7 @@ class Store {
     }
     const sibs = this.siblings(parentId);
     const now = Date.now();
-    const page: PageRecord = {
+    const page: StoredPageRecord = {
       id: newId(),
       title: typeof input.title === "string" ? input.title : "",
       icon: input.icon ?? null,
@@ -456,7 +545,7 @@ class Store {
     };
     this.pages.set(page.id, page);
     void this.persist(page);
-    return page;
+    return toPublicRecord(page);
   }
 
   update(id: string, patch: Record<string, unknown>): PageRecord {
@@ -494,7 +583,92 @@ class Store {
     if (Array.isArray(patch.content)) page.content = patch.content;
     page.updatedAt = Date.now();
     void this.persist(page);
-    return page;
+    return toPublicRecord(page);
+  }
+
+  configureShare(id: string, input: ShareUpdateInput): PageMeta {
+    const page = this.get(id);
+    const prev = page.share;
+    const token =
+      input.rotateToken || !prev?.token
+        ? crypto.randomBytes(12).toString("hex")
+        : prev.token;
+    const next: StoredShareConfig = {
+      enabled: typeof input.enabled === "boolean" ? input.enabled : Boolean(prev?.enabled),
+      token,
+      allowFormSubmit:
+        typeof input.allowFormSubmit === "boolean" ? input.allowFormSubmit : Boolean(prev?.allowFormSubmit),
+      showMeta: typeof input.showMeta === "boolean" ? input.showMeta : prev?.showMeta !== false,
+      showBrand: typeof input.showBrand === "boolean" ? input.showBrand : prev?.showBrand !== false,
+      ...(prev?.passwordSalt && prev?.passwordHash
+        ? { passwordSalt: prev.passwordSalt, passwordHash: prev.passwordHash }
+        : {}),
+    };
+
+    if (input.password === "__CLEAR__") {
+      delete next.passwordSalt;
+      delete next.passwordHash;
+    } else if (typeof input.password === "string" && input.password.trim()) {
+      const salt = crypto.randomBytes(16).toString("hex");
+      const hash = crypto.scryptSync(input.password.trim(), salt, 32).toString("hex");
+      next.passwordSalt = salt;
+      next.passwordHash = hash;
+    }
+
+    page.share = next;
+    page.updatedAt = Date.now();
+    void this.persist(page);
+    return toMeta(page);
+  }
+
+  findByShareToken(token: string): StoredPageRecord {
+    if (!/^[a-f0-9]{16,32}$/.test(token)) throw new HttpError(404, "分享链接无效或已关闭");
+    for (const p of this.pages.values()) {
+      if (!p.trashed && !p.hidden && p.share?.enabled && p.share.token === token) {
+        return p;
+      }
+    }
+    throw new HttpError(404, "分享链接无效或已关闭");
+  }
+
+  verifySharePassword(page: StoredPageRecord, password?: string | null): boolean {
+    if (!page.share?.passwordHash || !page.share.passwordSalt) return true;
+    const pwd = (password ?? "").trim();
+    if (!pwd) return false;
+    const candidate = crypto.scryptSync(pwd, page.share.passwordSalt, 32);
+    const expected = Buffer.from(page.share.passwordHash, "hex");
+    return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
+  }
+
+  submitSharedForm(
+    token: string,
+    password: string | undefined,
+    title: string,
+    rawProps: unknown,
+  ): PageMeta {
+    const dbPage = this.findByShareToken(token);
+    if (!this.verifySharePassword(dbPage, password)) {
+      throw new HttpError(401, "访问口令错误");
+    }
+    if (dbPage.kind !== "database" || !dbPage.share?.allowFormSubmit) {
+      throw new HttpError(403, "此分享页未开启公开表单提交");
+    }
+    const allowedPropIds = new Set(
+      (dbPage.database?.properties ?? [])
+        .filter((p) => p.type !== "formula" && p.type !== "rollup" && p.type !== "button")
+        .map((p) => p.id),
+    );
+    const cleaned = cleanProps(rawProps) ?? {};
+    const filteredProps: Record<string, PropValue> = {};
+    for (const [k, v] of Object.entries(cleaned)) {
+      if (allowedPropIds.has(k)) filteredProps[k] = v;
+    }
+    const created = this.create({
+      parentId: dbPage.id,
+      title: title.trim().slice(0, 500) || "新表单提交",
+      props: filteredProps,
+    });
+    return created;
   }
 
   move(id: string, parentId: string | null, index: number) {
@@ -565,14 +739,14 @@ class Store {
 
   /** 复制一个页面和它的全部子页面；copies 记录“原页面 id → 副本” */
   private copySubtree(
-    from: PageRecord,
+    from: StoredPageRecord,
     parentId: string | null,
     title: string,
-    copies: Map<string, PageRecord>,
-  ): PageRecord {
+    copies: Map<string, StoredPageRecord>,
+  ): StoredPageRecord {
     // 先取子页面列表，免得把刚建出来的副本也算进去
     const children = this.siblings(from.id);
-    const copy = this.create({
+    const created = this.create({
       parentId,
       title,
       icon: from.icon,
@@ -583,10 +757,12 @@ class Store {
       database: structuredClone(from.database),
       props: structuredClone(from.props),
     });
+    const copy = this.get(created.id);
     if (typeof from.coverY === "number") copy.coverY = from.coverY;
     copy.fullWidth = from.fullWidth;
     copy.smallText = from.smallText;
     copy.font = from.font;
+    void this.persist(copy);
     copies.set(from.id, copy);
     for (const child of children) this.copySubtree(child, copy.id, child.title, copies);
     return copy;
@@ -596,7 +772,7 @@ class Store {
    * 副本里指向“被一起复制的页面”的引用（子页面链接、内嵌数据库、关联）改指向对应的副本，
    * 否则副本里的内嵌数据库仍然是原来那一个，改一处两边都变。
    */
-  private remapCopies(copies: Map<string, PageRecord>) {
+  private remapCopies(copies: Map<string, StoredPageRecord>) {
     for (const page of copies.values()) {
       const before = JSON.stringify([page.content, page.props, page.database]);
       let json = before;
@@ -614,13 +790,13 @@ class Store {
 
   duplicate(id: string): PageRecord {
     const src = this.get(id);
-    const copies = new Map<string, PageRecord>();
+    const copies = new Map<string, StoredPageRecord>();
     const copy = this.copySubtree(src, src.parentId, `${src.title || "无标题"}（副本）`, copies);
     this.remapCopies(copies);
     // 放到原页面的正后方
     const sibs = this.siblings(src.parentId, copy.id);
     this.move(copy.id, src.parentId, sibs.findIndex((p) => p.id === src.id) + 1);
-    return copy;
+    return toPublicRecord(copy);
   }
 
   /** 把模板的内容套到一个已有页面上：正文、图标、封面和子页面都复制过来 */
@@ -629,7 +805,7 @@ class Store {
     const template = this.get(templateId);
     if (target.id === template.id) throw new HttpError(400, "不能把页面套用到它自己身上");
     this.snapshot(target, true);
-    const copies = new Map<string, PageRecord>([[template.id, target]]);
+    const copies = new Map<string, StoredPageRecord>([[template.id, target]]);
     for (const child of this.siblings(template.id)) this.copySubtree(child, target.id, child.title, copies);
     target.content = structuredClone(template.content);
     target.icon = target.icon ?? template.icon;
@@ -652,7 +828,7 @@ class Store {
   /* ---------- 页面历史 ---------- */
 
   /** 给页面当前的样子存一个历史版本。默认同一页面每 10 分钟最多存一次。 */
-  private snapshot(page: PageRecord, force = false) {
+  private snapshot(page: StoredPageRecord, force = false) {
     if (page.kind !== "page") return;
     if (page.content.length === 0 && !page.title) return;
     const now = Date.now();
@@ -737,7 +913,7 @@ class Store {
     for (const f of await fs.readdir(srcPages)) {
       if (!f.endsWith(".json")) continue;
       try {
-        const page = JSON.parse(await fs.readFile(path.join(srcPages, f), "utf8")) as PageRecord;
+        const page = JSON.parse(await fs.readFile(path.join(srcPages, f), "utf8")) as StoredPageRecord;
         if (!ID_RE.test(page.id) || `${page.id}.json` !== f) continue;
         if (this.pages.has(page.id)) {
           skipped++;
@@ -778,7 +954,7 @@ class Store {
   }
 
   /** 行的属性值也参与搜索：文本原样，单选/多选换成选项名 */
-  private propsText(p: PageRecord): string[] {
+  private propsText(p: StoredPageRecord): string[] {
     const defs = (p.parentId ? this.pages.get(p.parentId)?.database?.properties : null) ?? [];
     const out: string[] = [];
     for (const [key, value] of Object.entries(p.props ?? {})) {
@@ -879,7 +1055,7 @@ class Store {
   }
 
   /** 将一个页面（或数据库及其行）整理为供大模型阅读的结构化上下文 */
-  private formatPageContext(p: PageRecord, maxBody = 3500): string {
+  private formatPageContext(p: StoredPageRecord, maxBody = 3500): string {
     const lines: string[] = [`# ${p.title || "无标题"}`];
     if (p.parentId) {
       const parent = this.pages.get(p.parentId);
@@ -1033,6 +1209,40 @@ export function createApiMiddleware(dataDir: string) {
     trashPage: (id) => store.trash(id),
     flush: () => store.settled(),
   });
+  const backup = new BackupService(dataDir, store.uploadsDir, async () => {
+    await store.init();
+    await store.settled();
+    return store.allRecords();
+  });
+  backup.startScheduler();
+
+  /* ---------- 实时事件流（SSE）：多窗口 / MCP Agent / 剪藏 / 磁盘同步即时推送 ---------- */
+  const sseClients = new Map<ServerResponse, string>();
+  let currentClientId = "";
+  const heartbeat = setInterval(() => {
+    for (const res of sseClients.keys()) {
+      res.write(": ping\n\n");
+    }
+  }, 25_000);
+  (heartbeat as unknown as { unref?: () => void }).unref?.();
+
+  function broadcastSse(payload: unknown) {
+    if (sseClients.size === 0) return;
+    const msg = `data: ${JSON.stringify(payload)}\n\n`;
+    for (const res of sseClients.keys()) {
+      res.write(msg);
+    }
+  }
+
+  store.onChange = (ids) => {
+    broadcastSse({
+      type: "pages-changed",
+      ids,
+      sourceClientId: currentClientId || null,
+      peers: sseClients.size,
+      ts: Date.now(),
+    });
+  };
 
   async function serveUpload(name: string, res: ServerResponse) {
     if (!UPLOAD_RE.test(name)) throw new HttpError(404, "文件不存在");
@@ -1064,6 +1274,17 @@ export function createApiMiddleware(dataDir: string) {
     }
 
     const [, resource, id, action, sub, verb] = parts;
+    const reqClientId = typeof req.headers["x-client-id"] === "string" ? req.headers["x-client-id"].slice(0, 40) : "";
+    const withClient = <T>(fn: () => T): T => {
+      const prev = currentClientId;
+      currentClientId = reqClientId;
+      try {
+        return fn();
+      } finally {
+        currentClientId = prev;
+      }
+    };
+
     const origin = req.headers.origin;
     const isCrossOrigin = Boolean(origin && new URL(origin).host !== req.headers.host);
     const allowExternalBearer =
@@ -1089,6 +1310,67 @@ export function createApiMiddleware(dataDir: string) {
     }
     await store.init();
 
+    if (resource === "events" && !id && method === "GET") {
+      const cid = url.searchParams.get("clientId")?.slice(0, 40) || newId();
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      sseClients.set(res, cid);
+      res.write(`data: ${JSON.stringify({ type: "presence", peers: sseClients.size })}\n\n`);
+      broadcastSse({ type: "presence", peers: sseClients.size });
+      req.on("close", () => {
+        sseClients.delete(res);
+        broadcastSse({ type: "presence", peers: sseClients.size });
+      });
+      return;
+    }
+
+    if (resource === "public" && id === "share" && action) {
+      const token = action;
+      const page = store.findByShareToken(token);
+      const headerPwd =
+        typeof req.headers["x-share-password"] === "string"
+          ? decodeURIComponent(req.headers["x-share-password"])
+          : "";
+
+      if (!sub && method === "GET") {
+        if (!store.verifySharePassword(page, headerPwd)) {
+          return send(res, 200, { locked: true, title: page.title || "无标题", icon: page.icon });
+        }
+        const pubPage = toPublicRecord(page);
+        pubPage.comments = [];
+        const rows =
+          page.kind === "database"
+            ? store
+                .metas()
+                .filter((m) => m.parentId === page.id && !m.trashed)
+                .map((m) => ({ ...m, comments: [] }))
+            : [];
+        return send(res, 200, { locked: false, page: pubPage, rows });
+      }
+
+      if (sub === "verify" && method === "POST") {
+        const body = await readJson(req);
+        const pwd = typeof body.password === "string" ? body.password : "";
+        if (!store.verifySharePassword(page, pwd)) {
+          throw new HttpError(401, "访问口令不正确");
+        }
+        return send(res, 200, { ok: true });
+      }
+
+      if (sub === "submit" && method === "POST") {
+        const body = await readJson(req);
+        const pwd = typeof body.password === "string" ? body.password : headerPwd;
+        const title = typeof body.title === "string" ? body.title : "";
+        const row = withClient(() => store.submitSharedForm(token, pwd, title, body.props));
+        await store.settled();
+        return send(res, 201, { row });
+      }
+    }
+
     const all = () => send(res, 200, { pages: store.metas() });
 
     if (resource === "pages" && !id) {
@@ -1096,17 +1378,19 @@ export function createApiMiddleware(dataDir: string) {
       if (method === "POST") {
         const body = await readJson(req);
         const parentId = typeof body.parentId === "string" ? body.parentId : null;
-        const page = store.create({
-          parentId,
-          title: typeof body.title === "string" ? body.title : "",
-          icon: typeof body.icon === "string" ? body.icon : null,
-          tags: cleanTags(body.tags),
-          kind: body.kind === "database" ? "database" : "page",
-          database: cleanDatabase(body.database),
-          props: cleanProps(body.props) ?? {},
-          content: Array.isArray(body.content) ? body.content : [],
-          hidden: body.hidden === true,
-        });
+        const page = withClient(() =>
+          store.create({
+            parentId,
+            title: typeof body.title === "string" ? body.title : "",
+            icon: typeof body.icon === "string" ? body.icon : null,
+            tags: cleanTags(body.tags),
+            kind: body.kind === "database" ? "database" : "page",
+            database: cleanDatabase(body.database),
+            props: cleanProps(body.props) ?? {},
+            content: Array.isArray(body.content) ? body.content : [],
+            hidden: body.hidden === true,
+          }),
+        );
         return send(res, 201, { id: page.id, pages: store.metas() });
       }
     }
@@ -1114,13 +1398,14 @@ export function createApiMiddleware(dataDir: string) {
     if (resource === "pages" && id) {
       if (!ID_RE.test(id)) throw new HttpError(404, "页面不存在");
       if (!action) {
-        if (method === "GET") return send(res, 200, { page: store.get(id) });
+        if (method === "GET") return send(res, 200, { page: store.getPublic(id) });
         if (method === "PATCH") {
-          const page = store.update(id, await readJson(req));
+          const body = await readJson(req);
+          const page = withClient(() => store.update(id, body));
           return send(res, 200, { page: toMeta(page) });
         }
         if (method === "DELETE") {
-          store.remove(id);
+          withClient(() => store.remove(id));
           return all();
         }
       } else if (action === "backlinks" && method === "GET") {
@@ -1135,26 +1420,40 @@ export function createApiMiddleware(dataDir: string) {
         }
       } else if (method === "POST") {
         const body = await readJson(req);
+        if (action === "share") {
+          const meta = withClient(() =>
+            store.configureShare(id, {
+              enabled: typeof body.enabled === "boolean" ? body.enabled : undefined,
+              password: typeof body.password === "string" ? body.password : undefined,
+              allowFormSubmit: typeof body.allowFormSubmit === "boolean" ? body.allowFormSubmit : undefined,
+              showMeta: typeof body.showMeta === "boolean" ? body.showMeta : undefined,
+              showBrand: typeof body.showBrand === "boolean" ? body.showBrand : undefined,
+              rotateToken: body.rotateToken === true,
+            }),
+          );
+          return send(res, 200, { page: meta, pages: store.metas() });
+        }
         if (action === "apply-template") {
-          if (typeof body.templateId !== "string" || !ID_RE.test(body.templateId)) throw new HttpError(400, "缺少模板");
-          store.applyTemplate(id, body.templateId);
+          const templateId = body.templateId;
+          if (typeof templateId !== "string" || !ID_RE.test(templateId)) throw new HttpError(400, "缺少模板");
+          withClient(() => store.applyTemplate(id, templateId));
           return all();
         }
         if (action === "trash") {
-          store.trash(id);
+          withClient(() => store.trash(id));
           return all();
         }
         if (action === "restore") {
-          store.restore(id);
+          withClient(() => store.restore(id));
           return all();
         }
         if (action === "duplicate") {
-          const copy = store.duplicate(id);
+          const copy = withClient(() => store.duplicate(id));
           return send(res, 201, { id: copy.id, pages: store.metas() });
         }
         if (action === "move") {
           const parentId = typeof body.parentId === "string" ? body.parentId : null;
-          store.move(id, parentId, typeof body.index === "number" ? body.index : Infinity);
+          withClient(() => store.move(id, parentId, typeof body.index === "number" ? body.index : Infinity));
           return all();
         }
       }
@@ -1332,6 +1631,101 @@ export function createApiMiddleware(dataDir: string) {
         res.end(zipBuf);
         return;
       }
+      if (id === "export-encrypted" && method === "POST") {
+        const body = await readJson(req);
+        const password = typeof body.password === "string" ? body.password : "";
+        if (!password.trim()) throw new HttpError(400, "请设置备份加密口令");
+        await store.settled();
+        const zipBuf = await exportWorkspaceBackupZip(store.allRecords(), store.uploadsDir);
+        const encBuf = encryptBackupBuffer(zipBuf, password);
+        const day = new Date().toISOString().slice(0, 10);
+        res.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": encBuf.length,
+          "Content-Disposition": `attachment; filename="OpenNotion-backup-${day}.opennotion.enc"`,
+          "Cache-Control": "no-store",
+        });
+        res.end(encBuf);
+        return;
+      }
+      if (id === "decrypt" && method === "POST") {
+        if (req.headers["x-upload"] !== "1") throw new HttpError(400, "缺少上传标记");
+        const pwd =
+          typeof req.headers["x-backup-password"] === "string"
+            ? decodeURIComponent(req.headers["x-backup-password"])
+            : "";
+        const encBuf = await readBody(req, MAX_UPLOAD);
+        try {
+          const zipBuf = decryptBackupBuffer(encBuf, pwd);
+          res.writeHead(200, {
+            "Content-Type": "application/zip",
+            "Content-Length": zipBuf.length,
+            "Cache-Control": "no-store",
+          });
+          res.end(zipBuf);
+          return;
+        } catch (err) {
+          throw new HttpError(400, err instanceof Error ? err.message : String(err));
+        }
+      }
+      if (id === "config") {
+        if (method === "GET") {
+          return send(res, 200, { config: await backup.getPublicConfig() });
+        }
+        if (method === "PUT") {
+          const body = (await readJson(req)) as unknown as BackupConfigUpdate;
+          return send(res, 200, { config: await backup.updateConfig(body) });
+        }
+      }
+      if (id === "snapshots") {
+        if (!action && method === "GET") {
+          return send(res, 200, { snapshots: await backup.listSnapshots() });
+        }
+        if (action && method === "GET") {
+          const pwd =
+            typeof req.headers["x-backup-password"] === "string"
+              ? decodeURIComponent(req.headers["x-backup-password"])
+              : undefined;
+          try {
+            const zipBuf = await backup.readSnapshotZip(decodeURIComponent(action), pwd);
+            res.writeHead(200, {
+              "Content-Type": "application/zip",
+              "Content-Length": zipBuf.length,
+              "Cache-Control": "no-store",
+            });
+            res.end(zipBuf);
+            return;
+          } catch (err) {
+            throw new HttpError(400, err instanceof Error ? err.message : String(err));
+          }
+        }
+        if (action && method === "DELETE") {
+          await backup.deleteSnapshot(decodeURIComponent(action));
+          return send(res, 200, { snapshots: await backup.listSnapshots() });
+        }
+      }
+      if (id === "run-now" && method === "POST") {
+        await readJson(req);
+        try {
+          const result = await backup.runBackupNow();
+          return send(res, 200, { ...result, snapshots: await backup.listSnapshots() });
+        } catch (err) {
+          throw new HttpError(400, err instanceof Error ? err.message : String(err));
+        }
+      }
+      if (id === "test-webdav" && method === "POST") {
+        const body = await readJson(req);
+        try {
+          const result = await backup.testWebDav({
+            url: typeof body.url === "string" ? body.url : undefined,
+            username: typeof body.username === "string" ? body.username : undefined,
+            password: typeof body.password === "string" ? body.password : undefined,
+          });
+          return send(res, 200, result);
+        } catch (err) {
+          throw new HttpError(400, err instanceof Error ? err.message : String(err));
+        }
+      }
       if (id === "restore-records" && method === "POST") {
         const body = await readJson(req);
         const records = Array.isArray(body.records) ? body.records : [];
@@ -1392,9 +1786,18 @@ export function createApiMiddleware(dataDir: string) {
 
   return Object.assign(middleware, {
     mcp,
+    backup,
     flush: () => store.settled(),
     sync: () => store.syncFromDisk(),
-    close: () => store.close(),
+    close: () => {
+      clearInterval(heartbeat);
+      for (const res of sseClients.keys()) {
+        res.end();
+      }
+      sseClients.clear();
+      backup.close();
+      store.close();
+    },
     importFolder: (dir: string) => store.importFolder(dir),
   });
 }

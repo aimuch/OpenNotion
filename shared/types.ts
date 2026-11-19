@@ -162,6 +162,13 @@ export interface DatabaseDef {
   automations?: DatabaseAutomation[];
 }
 
+export interface PageCommentReply {
+  id: string;
+  author: string;
+  text: string;
+  createdAt: number;
+}
+
 export interface PageComment {
   id: string;
   author: string;
@@ -169,7 +176,22 @@ export interface PageComment {
   /** 选中正文划词批注时引用的原文片段 */
   quote?: string;
   resolved?: boolean;
+  /** 讨论串多轮回复列表 */
+  replies?: PageCommentReply[];
   createdAt: number;
+}
+
+export interface PageShareConfig {
+  enabled: boolean;
+  token: string;
+  /** 是否开启了访问口令保护（服务端只保存哈希，不明文回传口令） */
+  hasPassword?: boolean;
+  /** 数据库页面发布后，是否允许外部访客填写并提交公开表单 */
+  allowFormSubmit?: boolean;
+  /** 是否在公开分享页展示更新时间与字数 */
+  showMeta?: boolean;
+  /** 是否在公开分享页展示底部品牌署名 */
+  showBrand?: boolean;
 }
 
 export interface PageMeta {
@@ -182,6 +204,8 @@ export interface PageMeta {
   coverY?: number;
   /** 多维页面分类标签（不含 # 前缀） */
   tags?: string[];
+  /** 网页公开分享与访问密码保护状态 */
+  share?: PageShareConfig;
   parentId: string | null;
   order: number;
   favorite: boolean;
@@ -365,4 +389,67 @@ export interface ClipResult {
   siteName: string;
   blockCount: number;
   pages: PageMeta[];
+}
+
+export interface ShareUpdateInput {
+  enabled?: boolean;
+  /** 传非空字符串设置新密码；传 "__CLEAR__" 清除密码；不传保持不变 */
+  password?: string;
+  allowFormSubmit?: boolean;
+  showMeta?: boolean;
+  showBrand?: boolean;
+  rotateToken?: boolean;
+}
+
+export type PublicSharePayload =
+  | {
+      locked: true;
+      title: string;
+      icon: string | null;
+    }
+  | {
+      locked: false;
+      page: PageRecord;
+      rows: PageMeta[];
+    };
+
+export interface WebDavConfigPublic {
+  enabled: boolean;
+  url: string;
+  username: string;
+  hasPassword: boolean;
+  remoteDir: string;
+}
+
+export interface BackupConfigPublic {
+  autoEnabled: boolean;
+  intervalHours: number;
+  keepCount: number;
+  hasEncryptPassword: boolean;
+  lastBackupAt: number | null;
+  lastStatus: string | null;
+  webdav: WebDavConfigPublic;
+}
+
+export interface BackupConfigUpdate {
+  autoEnabled?: boolean;
+  intervalHours?: number;
+  keepCount?: number;
+  /** 传非空设置自动备份加密密码；传 "__CLEAR__" 清除密码 */
+  encryptPassword?: string;
+  webdav?: {
+    enabled?: boolean;
+    url?: string;
+    username?: string;
+    /** 传非空设置 WebDAV 密码；传 "__CLEAR__" 清除密码 */
+    password?: string;
+    remoteDir?: string;
+  };
+}
+
+export interface BackupSnapshotItem {
+  filename: string;
+  size: number;
+  createdAt: number;
+  encrypted: boolean;
 }

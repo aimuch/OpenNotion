@@ -341,3 +341,43 @@ export async function suggestPageTags(
     ),
   ).slice(0, 5);
 }
+
+/** AI 一键生成思维导图缩进大纲 */
+export async function generateMindMapOutline(instruction: string, pageContext: string): Promise<string> {
+  const prompt = [
+    instruction.trim() ? `生成主题/要求：${instruction.trim()}` : "请根据下方页面内容提炼结构清晰的思维导图大纲",
+    pageContext.trim() ? `参考上下文：\n${pageContext.slice(0, 3200)}` : "",
+    "\n输出格式要求：\n1. 只输出纯缩进无序列表（每级缩进 2 个空格，以 `- ` 开头）；\n2. 第一行是唯一中心主题（无缩进 `- 中心主题`），下设 3~5 个一级分支，每个一级分支下设 2~4 个二级要点；\n3. 节点文字精炼（2~14 字），严禁输出代码块围栏或任何额外说明文字。",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  const raw = await streamAiChat({
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.4,
+  });
+  return raw
+    .replace(/^```[\w-]*\n?/gm, "")
+    .replace(/```$/gm, "")
+    .trim();
+}
+
+/** AI 一键生成 Mermaid 流程图 / 时序图 / 饼图代码 */
+export async function generateMermaidCode(instruction: string, pageContext: string): Promise<string> {
+  const prompt = [
+    instruction.trim() ? `图表要求：${instruction.trim()}` : "请根据下方页面内容提炼一张清晰的 Mermaid 流程图",
+    pageContext.trim() ? `参考上下文：\n${pageContext.slice(0, 3200)}` : "",
+    "\n输出格式要求：\n1. 仅支持 `flowchart LR`、`flowchart TD`、`sequenceDiagram` 或 `pie title ...` 四种语法之一；\n2. 只输出纯 Mermaid 语法源码，严禁包含 ```mermaid 代码块围栏或任何解释文字；\n3. 节点标签简洁清晰，避免特殊括号字符语法错误。",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  const raw = await streamAiChat({
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.3,
+  });
+  return raw
+    .replace(/^```[\w-]*\n?/gm, "")
+    .replace(/```$/gm, "")
+    .trim();
+}

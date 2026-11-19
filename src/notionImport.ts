@@ -19,7 +19,19 @@ export interface ImportResult {
   databases: number;
   rows: number;
   files: number;
-  source?: "backup" | "obsidian" | "notion";
+  source?: "backup" | "obsidian" | "evernote" | "notion";
+}
+
+export function isEncryptedBackupBytes(bytes: Uint8Array): boolean {
+  return (
+    bytes.byteLength > 50 &&
+    bytes[0] === 0x4f &&
+    bytes[1] === 0x4e &&
+    bytes[2] === 0x45 &&
+    bytes[3] === 0x4e &&
+    bytes[4] === 0x43 &&
+    bytes[5] === 0x31
+  );
 }
 
 let cachedParserEditor: NoteEditor | null = null;
@@ -234,8 +246,18 @@ function extractFrontmatter(raw: string): { body: string; title?: string; icon?:
 }
 
 export async function importNotionZip(file: File, onProgress: (text: string) => void): Promise<ImportResult> {
+  if (file.name.toLowerCase().endsWith(".enex")) {
+    return importEvernoteEnex(await file.text(), onProgress, file.name.replace(/\.enex$/i, ""));
+  }
   onProgress("正在读取压缩包…");
-  let entries = readZip(await file.arrayBuffer());
+  return importNotionZipBuffer(await file.arrayBuffer(), onProgress);
+}
+
+export async function importNotionZipBuffer(
+  buffer: ArrayBuffer,
+  onProgress: (text: string) => void,
+): Promise<ImportResult> {
+  let entries = readZip(buffer);
   // 较大的导出会是“zip 里套着几个分卷 zip”
   if (entries.length > 0 && entries.every((e) => e.path.toLowerCase().endsWith(".zip"))) {
     const inner: ZipEntry[] = [];
@@ -498,4 +520,215 @@ export async function importNotionZip(file: File, onProgress: (text: string) => 
   }
 
   return result;
+}
+
+/* =========================================================
+ * 印象笔记 / Evernote (.enex) 导入器（解析 ENML 富文本、待办、标签与内嵌附件）
+ * ========================================================= */
+
+function md5Hex(bytes: Uint8Array): string {
+  const K = new Uint32Array(64);
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0;
+  const S = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+  ];
+  const bitLen = bytes.length * 8;
+  const padLen = ((56 - ((bytes.length + 1) % 64)) + 64) % 64;
+  const buf = new Uint8Array(bytes.length + 1 + padLen + 8);
+  buf.set(bytes);
+  buf[bytes.length] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(buf.length - 8, bitLen >>> 0, true);
+  dv.setUint32(buf.length - 4, Math.floor(bitLen / 0x100000000) >>> 0, true);
+
+  let a0 = 0x67452301;
+  let b0 = 0xefcdab89;
+  let c0 = 0x98badcfe;
+  let d0 = 0x10325476;
+
+  for (let off = 0; off < buf.length; off += 64) {
+    let a = a0, b = b0, c = c0, d = d0;
+    for (let i = 0; i < 64; i++) {
+      let f = 0, g = 0;
+      if (i < 16) { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+      else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+      else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+      const tmp = d;
+      d = c;
+      c = b;
+      const sum = (a + f + K[i] + dv.getUint32(off + g * 4, true)) >>> 0;
+      b = (b + ((sum << S[i]) | (sum >>> (32 - S[i])))) >>> 0;
+      a = tmp;
+    }
+    a0 = (a0 + a) >>> 0;
+    b0 = (b0 + b) >>> 0;
+    c0 = (c0 + c) >>> 0;
+    d0 = (d0 + d) >>> 0;
+  }
+
+  const out = new Uint8Array(16);
+  const outDv = new DataView(out.buffer);
+  outDv.setUint32(0, a0, true);
+  outDv.setUint32(4, b0, true);
+  outDv.setUint32(8, c0, true);
+  outDv.setUint32(12, d0, true);
+  return [...out].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_m, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&amp;/g, "&");
+}
+
+function enmlToMarkdown(enml: string, mediaMap: ReadonlyMap<string, { url: string; mime: string; name: string }>): string {
+  let s = enml
+    .replace(/^[\s\S]*?<en-note[^>]*>/i, "")
+    .replace(/<\/en-note>[\s\S]*$/i, "");
+
+  // 替换 <en-media hash="..." type="..." />
+  s = s.replace(/<en-media\b([^>]*?)\/?>/gi, (_m, attrs: string) => {
+    const hash = /\bhash=["']([a-fA-F0-9]+)["']/.exec(attrs)?.[1]?.toLowerCase() ?? "";
+    const found = mediaMap.get(hash);
+    if (!found) return "";
+    if (found.mime.startsWith("image/")) {
+      return `\n![${found.name}](${found.url})\n`;
+    }
+    return `\n[${found.name}](${found.url})\n`;
+  });
+
+  // 替换 <en-todo checked="true|false"/>
+  s = s.replace(/<en-todo\b([^>]*?)\/?>/gi, (_m, attrs: string) => {
+    const checked = /\bchecked=["']true["']/i.test(attrs);
+    return checked ? "- [x] " : "- [ ] ";
+  });
+
+  s = s
+    .replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, "\n# $1\n")
+    .replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, "\n## $1\n")
+    .replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, "\n### $1\n")
+    .replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_m, code: string) => `\n\`\`\`\n${decodeXmlEntities(code.replace(/<[^>]+>/g, ""))}\n\`\`\`\n`)
+    .replace(/<(?:b|strong)[^>]*>([\s\S]*?)<\/(?:b|strong)>/gi, "**$1**")
+    .replace(/<(?:i|em)[^>]*>([\s\S]*?)<\/(?:i|em)>/gi, "*$1*")
+    .replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`")
+    .replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)")
+    .replace(/<li[^>]*>\s*(- \[[ x]\] )/gi, "\n$1")
+    .replace(/<li[^>]*>/gi, "\n- ")
+    .replace(/<\/li>/gi, "")
+    .replace(/<hr\b[^>]*\/?>/gi, "\n---\n")
+    .replace(/<br\b[^>]*\/?>/gi, "\n")
+    .replace(/<\/(?:div|p|ul|ol|blockquote|table|tr)>/gi, "\n")
+    .replace(/<[^>]+>/g, "");
+
+  return decodeXmlEntities(s)
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function mimeToExt(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes("png")) return "png";
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("webp")) return "webp";
+  if (m.includes("svg")) return "svg";
+  if (m.includes("pdf")) return "pdf";
+  return "bin";
+}
+
+export async function importEvernoteEnex(
+  xmlText: string,
+  onProgress: (text: string) => void,
+  notebookName = "印象笔记导入",
+): Promise<ImportResult> {
+  onProgress("正在解析印象笔记 .enex 归档…");
+  const noteBlocks = [...xmlText.matchAll(/<note>([\s\S]*?)<\/note>/gi)].map((m) => m[1]);
+  if (noteBlocks.length === 0) {
+    throw new Error("未在 .enex 文件中找到任何 <note> 笔记条目");
+  }
+
+  let parentId: string | null = null;
+  let rootId = "";
+  if (noteBlocks.length > 1) {
+    parentId = await createPage({ title: notebookName || "印象笔记导入", icon: "🐘", quiet: true });
+    rootId = parentId ?? "";
+  }
+
+  const editor = getHeadlessParserEditor();
+  let pages = 0;
+  let files = 0;
+
+  for (let idx = 0; idx < noteBlocks.length; idx++) {
+    const rawNote = noteBlocks[idx];
+    const titleRaw = /<title>([\s\S]*?)<\/title>/i.exec(rawNote)?.[1] ?? "";
+    const title = decodeXmlEntities(titleRaw.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")).trim() || "未命名笔记";
+    onProgress(`正在导入印象笔记 ${idx + 1} / ${noteBlocks.length}：${title}`);
+
+    const tags = [...rawNote.matchAll(/<tag>([\s\S]*?)<\/tag>/gi)]
+      .map((m) => decodeXmlEntities(m[1]).trim())
+      .filter(Boolean);
+
+    const mediaMap = new Map<string, { url: string; mime: string; name: string }>();
+    const resources = [...rawNote.matchAll(/<resource>([\s\S]*?)<\/resource>/gi)].map((m) => m[1]);
+    for (const resXml of resources) {
+      const b64 = /<data[^>]*>([\s\S]*?)<\/data>/i.exec(resXml)?.[1]?.replace(/\s+/g, "") ?? "";
+      if (!b64) continue;
+      const mime = /<mime>([\s\S]*?)<\/mime>/i.exec(resXml)?.[1]?.trim() || "application/octet-stream";
+      const fileNameRaw = /<file-name>([\s\S]*?)<\/file-name>/i.exec(resXml)?.[1];
+      const ext = mimeToExt(mime);
+      const name = fileNameRaw ? decodeXmlEntities(fileNameRaw).trim() : `attachment.${ext}`;
+      try {
+        const binStr = atob(b64);
+        const bytes = new Uint8Array(binStr.length);
+        for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+        const hash = md5Hex(bytes);
+        const uploadedUrl = await uploadFile(new File([bytes], name, { type: mime }));
+        mediaMap.set(hash, { url: uploadedUrl, mime, name });
+        files++;
+      } catch {
+        /* 跳过损坏的附件资源 */
+      }
+    }
+
+    const contentRaw = /<content>([\s\S]*?)<\/content>/i.exec(rawNote)?.[1] ?? "";
+    const enml = contentRaw.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1") || decodeXmlEntities(contentRaw);
+    const md = enmlToMarkdown(enml, mediaMap);
+
+    const noteId = await createPage({
+      parentId,
+      title,
+      icon: "📝",
+      tags,
+      quiet: true,
+    });
+    if (!noteId) throw new Error("创建导入页面失败");
+    if (!rootId) rootId = noteId;
+    pages++;
+
+    if (md) {
+      const blocks = await editor.tryParseMarkdownToBlocks(md);
+      updatePage(noteId, { content: blocks });
+      await flushPatch(noteId);
+    }
+  }
+
+  return {
+    rootId,
+    pages,
+    databases: 0,
+    rows: 0,
+    files,
+    source: "evernote",
+  };
 }

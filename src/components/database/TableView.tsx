@@ -547,17 +547,24 @@ function PropertyMenu({ anchor, page, def, view, allRows, onPatchView, onClose }
             onClick={() => sortBy("desc")}
           />
           <MenuDivider />
-          <MenuItem
-            icon={<Trash2 size={16} />}
-            label="删除属性"
-            danger
-            onClick={() => {
-              onClose();
-              if (window.confirm(`删除属性“${def.name}”？所有行里这一列的内容都会被丢弃。`)) removeProperty(page, def.id);
-            }}
-          />
+          <ConfirmDeletePropItem name={def.name} onConfirm={() => { onClose(); removeProperty(page, def.id); }} />
         </>
       )}
     </Popover>
+  );
+}
+
+function ConfirmDeletePropItem({ name, onConfirm }: { name: string; onConfirm: () => void }) {
+  const [armed, setArmed] = useState(false);
+  return (
+    <MenuItem
+      icon={<Trash2 size={16} />}
+      label={armed ? `再次点击确认删除“${name}”` : "删除属性"}
+      danger
+      onClick={() => {
+        if (!armed) setArmed(true);
+        else onConfirm();
+      }}
+    />
   );
 }

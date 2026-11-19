@@ -29,12 +29,13 @@ import {
 } from "lucide-react";
 import type { PageMeta, SearchHit } from "../../shared/types";
 import { blocksPlainText, suggestPageTags } from "../ai";
-import { transitionCover, transitionPageLoad, useMachine } from "../machines";
+import { transitionConfirmAction, transitionCover, transitionPageLoad, useMachine } from "../machines";
 import {
   ancestorsOf,
   applyTemplate,
   buildTree,
   closePageModal,
+  closeSplitPane,
   deletePage,
   fetchBacklinks,
   fetchPage,
@@ -87,10 +88,10 @@ function extractOutline(blocks: unknown[], out: OutlineItem[] = []): OutlineItem
   return out;
 }
 
-export function PageView({ id }: { id: string }) {
+export function PageView({ id, secondary = false }: { id: string; secondary?: boolean }) {
   const meta = useStore((s) => s.pages[id]);
   const parent = useStore((s) => (meta?.parentId ? s.pages[meta.parentId] : undefined));
-  const pageModal = useStore((s) => s.overlay.pageModal ?? "none");
+  const pageModal = useStore((s) => (secondary ? "none" : (s.overlay.pageModal ?? "none")));
   const [loadState, sendLoad] = useMachine(transitionPageLoad, { status: "loading" });
   const [reloadKey, setReloadKey] = useState(0);
   const [docTick, setDocTick] = useState(0);
@@ -209,10 +210,11 @@ ${bodyHtml}
     <div className="page" data-page-state={isDatabase ? "ready" : loadState.status}>
       <Topbar
         page={meta}
+        secondary={secondary}
         onExport={exportPrimary}
         exportLabel={isDatabase ? "导出为 CSV" : "导出为 Markdown"}
         onExportHtml={isDatabase ? undefined : () => void exportHtml()}
-        onPoster={isDatabase ? undefined : openPosterModal}
+        onPoster={openPosterModal}
         onHistory={isDatabase ? undefined : openHistoryModal}
         wordCount={wordCount}
       />
@@ -415,6 +417,7 @@ function FloatingOutline({ items }: { items: OutlineItem[] }) {
 
 interface TopbarProps {
   page: PageMeta;
+  secondary?: boolean;
   onExport: () => void;
   exportLabel: string;
   onExportHtml?: () => void;
@@ -423,7 +426,16 @@ interface TopbarProps {
   wordCount?: number;
 }
 
-function Topbar({ page, onExport, exportLabel, onExportHtml, onPoster, onHistory, wordCount }: TopbarProps) {
+function Topbar({
+  page,
+  secondary,
+  onExport,
+  exportLabel,
+  onExportHtml,
+  onPoster,
+  onHistory,
+  wordCount,
+}: TopbarProps) {
   const pages = useStore((s) => s.pages);
   const saveSummary = useStore((s) => s.saveSummary);
   const collapsed = useStore((s) => s.sidebarCollapsed);
@@ -433,7 +445,7 @@ function Topbar({ page, onExport, exportLabel, onExportHtml, onPoster, onHistory
 
   return (
     <header className="topbar">
-      {collapsed && (
+      {!secondary && collapsed && (
         <button
           type="button"
           className="icon-btn"
@@ -442,6 +454,17 @@ function Topbar({ page, onExport, exportLabel, onExportHtml, onPoster, onHistory
           onClick={() => setSidebarCollapsed(false)}
         >
           <PanelLeft size={18} />
+        </button>
+      )}
+      {secondary && (
+        <button
+          type="button"
+          className="icon-btn small"
+          title="关闭右侧分屏"
+          aria-label="关闭右侧分屏"
+          onClick={() => closeSplitPane()}
+        >
+          <X size={16} />
         </button>
       )}
       <nav className="breadcrumbs" aria-label="页面路径">
@@ -557,22 +580,41 @@ function Topbar({ page, onExport, exportLabel, onExportHtml, onPoster, onHistory
 }
 
 function TrashBanner({ page }: { page: PageMeta }) {
+  const [confirmState, sendConfirm] = useMachine(transitionConfirmAction, { status: "idle" });
+  const confirming = confirmState.status === "confirming" && confirmState.targetKey === page.id;
+
   return (
-    <div className="trash-banner" role="status">
+    <div className="trash-banner" role="status" data-confirm-state={confirmState.status}>
       <span className="trash-banner-text">
         <Trash2 size={15} /> 此页面在回收站中，暂时不能编辑。
       </span>
       <button type="button" onClick={() => void restorePage(page.id)}>
         <Undo2 size={14} /> 恢复页面
       </button>
-      <button
-        type="button"
-        onClick={() => {
-          if (window.confirm("永久删除此页面及其子页面？此操作无法撤销。")) void deletePage(page.id);
-        }}
-      >
-        <Trash2 size={14} /> 永久删除
-      </button>
+      {confirming ? (
+        <>
+          <button
+            type="button"
+            onClick={async () => {
+              sendConfirm({ type: "EXECUTE", targetKey: page.id });
+              try {
+                await deletePage(page.id);
+              } finally {
+                sendConfirm({ type: "DONE" });
+              }
+            }}
+          >
+            确认永久删除
+          </button>
+          <button type="button" onClick={() => sendConfirm({ type: "CANCEL" })}>
+            取消
+          </button>
+        </>
+      ) : (
+        <button type="button" onClick={() => sendConfirm({ type: "REQUEST", targetKey: page.id })}>
+          <Trash2 size={14} /> 永久删除
+        </button>
+      )}
     </div>
   );
 }

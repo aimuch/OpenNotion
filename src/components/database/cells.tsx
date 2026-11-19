@@ -36,7 +36,7 @@ import {
 } from "../../db";
 import { checkFormula } from "../../formula";
 import { fillRowWithAi } from "../../ai";
-import { navigate, setAiSettingsOpen, useStore, useTree } from "../../store";
+import { navigate, reportError, setAiSettingsOpen, useStore, useTree } from "../../store";
 import { Popover, cx } from "../Popover";
 import { ActionStepsEditor } from "./AutomationsMenu";
 
@@ -296,7 +296,7 @@ function TextCell({ row, def, dbPage }: CellProps) {
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               if (msg.includes("API Key")) setAiSettingsOpen(true);
-              else window.alert(msg);
+              else reportError(msg);
             } finally {
               setAiBusy(false);
             }
@@ -653,7 +653,7 @@ export function PropertyConfig({ dbPage, def, allRows }: { dbPage: PageMeta; def
               } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
                 if (msg.includes("API Key")) setAiSettingsOpen(true);
-                else window.alert(msg);
+                else reportError(msg);
               } finally {
                 setBatchBusy(false);
               }

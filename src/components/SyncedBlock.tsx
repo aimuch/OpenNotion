@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ComponentType } f
 import { createReactBlockSpec } from "@blocknote/react";
 import { RefreshCw } from "lucide-react";
 import type { PageRecord } from "../../shared/types";
+import { transitionSyncedBlock, useMachine } from "../machines";
 import { fetchPage, getState, updatePage, useStore } from "../store";
 import { Island } from "./Island";
 
@@ -43,8 +44,7 @@ function broadcastSynced(sourceId: string, fromInstance: string, blocks: unknown
 function SyncedIsland({ sourceId }: { sourceId: string }) {
   const instanceId = useId();
   const source = useStore((s) => s.pages[sourceId]);
-  const [record, setRecord] = useState<PageRecord | null>(null);
-  const [failed, setFailed] = useState(false);
+  const [syncState, sendSync] = useMachine(transitionSyncedBlock, { status: "loading", sourceId });
   const editorRef = useRef<SyncableEditorHandle | null>(null);
   const applyingRemote = useRef(false);
 
@@ -76,21 +76,31 @@ function SyncedIsland({ sourceId }: { sourceId: string }) {
 
   useEffect(() => {
     let alive = true;
+    sendSync({ type: "SWITCH_SOURCE", sourceId });
     fetchPage(sourceId).then(
-      (r) => alive && setRecord(r),
-      () => alive && setFailed(true),
+      (r) => alive && sendSync({ type: "LOADED", sourceId, record: r }),
+      () => alive && sendSync({ type: "FAILED", sourceId }),
     );
     return () => {
       alive = false;
     };
-  }, [sourceId]);
+  }, [sourceId, sendSync]);
 
-  if (failed || (!source && record === null && getState().loaded && !getState().pages[sourceId])) {
-    return <div className="inline-db-missing">这个同步块的内容已被删除，可以把这个块删掉。</div>;
+  const record = syncState.status === "ready" ? syncState.record : null;
+
+  if (
+    syncState.status === "missing" ||
+    (!source && record === null && getState().loaded && !getState().pages[sourceId])
+  ) {
+    return (
+      <div className="inline-db-missing" data-synced-state="missing">
+        这个同步块的内容已被删除，可以把这个块删掉。
+      </div>
+    );
   }
 
   return (
-    <div className="synced">
+    <div className="synced" data-synced-state={syncState.status}>
       <div className="synced-head">
         <RefreshCw size={13} />
         <input

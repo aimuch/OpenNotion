@@ -1,5 +1,8 @@
 import { useMemo, useSyncExternalStore } from "react";
 import type {
+  BackupConfigPublic,
+  BackupConfigUpdate,
+  BackupSnapshotItem,
   ClipRequest,
   ClipResult,
   HistoryEntry,
@@ -8,7 +11,10 @@ import type {
   PageMeta,
   PagePatch,
   PageRecord,
+  PropValue,
+  PublicSharePayload,
   SearchHit,
+  ShareUpdateInput,
   StorageInfo,
   UnfurlData,
 } from "../shared/types";
@@ -18,18 +24,22 @@ import {
   summarizeSaveStates,
   topOverlayName,
   transitionOverlay,
+  transitionSplitPane,
   type OverlayEvent,
   type OverlayState,
   type PageSavePhase,
   type SaveSummary,
   type SettingsTab,
+  type SplitPaneState,
 } from "./machines";
 
 export type ThemeSetting = "light" | "dark" | "system";
 
+const CLIENT_ID = `on_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+
 interface State {
   pages: Record<string, PageMeta>;
-  /** 页面正文被整体替换（恢复历史、套用模板、AI 追加）的次数；变了就要重新加载编辑器 */
+  /** 页面正文被整体替换（恢复历史、套用模板、AI 追加、外部实时同步）的次数；变了就要重新加载编辑器 */
   revisions: Record<string, number>;
   loaded: boolean;
   /** 派生自持久化保存状态机的全局保存摘要 */
@@ -43,6 +53,10 @@ interface State {
   theme: ThemeSetting;
   /** 统一的浮层与弹窗栈状态机 */
   overlay: OverlayState;
+  /** 双栏并排分屏状态机 */
+  splitPane: SplitPaneState;
+  /** 当前连接的实时客户端数（多窗口 / 外部订阅） */
+  livePeers: number;
   searchOpen: boolean;
   aiOpen: boolean;
   aiSettingsOpen: boolean;
@@ -92,6 +106,8 @@ let state: State = {
   sidebarWidth: readLocal("sidebarWidth", 260),
   theme: readTheme(),
   overlay: INITIAL_OVERLAY_STATE,
+  splitPane: { open: false },
+  livePeers: 1,
   searchOpen: false,
   aiOpen: false,
   aiSettingsOpen: false,
@@ -124,12 +140,14 @@ export function useStore<T>(selector: (s: State) => T): T {
 
 async function request<T>(url: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const { json, ...rest } = init ?? {};
+  const baseHeaders: Record<string, string> = {
+    "X-Client-Id": CLIENT_ID,
+    ...(json !== undefined ? { "Content-Type": "application/json" } : {}),
+    ...(rest.headers as Record<string, string> | undefined),
+  };
   const res = await fetch(url, {
     ...rest,
-    headers:
-      json !== undefined
-        ? { "Content-Type": "application/json", ...(rest.headers as Record<string, string> | undefined) }
-        : rest.headers,
+    headers: baseHeaders,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
   });
   const data = await res.json().catch(() => ({}));
@@ -147,18 +165,78 @@ export function reportError(err: unknown) {
 
 function setPages(list: PageMeta[]) {
   const pages: Record<string, PageMeta> = {};
+  const validIds = new Set<string>();
   for (const p of list) {
     // 尚未保存的本地修改（例如正在输入的标题）优先于服务器返回的值
     const pending = pendingPatches.get(p.id);
     const { content: _content, ...metaPatch } = pending?.patch ?? {};
-    pages[p.id] = pending ? { ...p, ...metaPatch } : p;
+    const merged = pending ? { ...p, ...metaPatch } : p;
+    pages[p.id] = merged;
+    if (!merged.trashed && !merged.hidden) validIds.add(merged.id);
   }
-  set({ pages });
+  const nextSplit = transitionSplitPane(state.splitPane, { type: "RECONCILE", validIds });
+  set({ pages, splitPane: nextSplit });
+}
+
+let liveSource: EventSource | null = null;
+let sseRefreshTimer: number | null = null;
+const sseChangedIds = new Set<string>();
+
+function ensureLiveEventStream() {
+  if (liveSource || typeof EventSource === "undefined") return;
+  try {
+    const es = new EventSource(`/api/events?clientId=${encodeURIComponent(CLIENT_ID)}`);
+    liveSource = es;
+    es.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data) as {
+          type?: string;
+          ids?: string[];
+          sourceClientId?: string | null;
+          peers?: number;
+        };
+        if (typeof msg.peers === "number" && msg.peers !== state.livePeers) {
+          set({ livePeers: Math.max(1, msg.peers) });
+        }
+        if (msg.type === "pages-changed" && msg.sourceClientId !== CLIENT_ID) {
+          for (const id of msg.ids ?? []) sseChangedIds.add(id);
+          if (sseRefreshTimer !== null) window.clearTimeout(sseRefreshTimer);
+          sseRefreshTimer = window.setTimeout(() => {
+            sseRefreshTimer = null;
+            const changed = [...sseChangedIds];
+            sseChangedIds.clear();
+            void request<{ pages: PageMeta[] }>("/api/pages")
+              .then(({ pages }) => {
+                setPages(pages);
+                const nextRev = { ...state.revisions };
+                let bumped = false;
+                for (const id of changed) {
+                  if (!pendingPatches.has(id) && !inflight.has(id)) {
+                    nextRev[id] = (nextRev[id] ?? 0) + 1;
+                    bumped = true;
+                  }
+                }
+                if (bumped) set({ revisions: nextRev });
+              })
+              .catch(() => {});
+          }, 120);
+        }
+      } catch {
+        /* 忽略格式异常的心跳帧 */
+      }
+    };
+    es.onerror = () => {
+      /* EventSource 内置自动指数退避重连 */
+    };
+  } catch {
+    /* 非标准运行时忽略 */
+  }
 }
 
 /* ---------- 页面数据 ---------- */
 
 export async function loadPages() {
+  ensureLiveEventStream();
   try {
     const { pages } = await request<{ pages: PageMeta[] }>("/api/pages");
     setPages(pages);
@@ -387,6 +465,129 @@ export async function restoreBackupRecords(records: unknown[]): Promise<{ import
   return { imported: data.imported, updated: data.updated };
 }
 
+export async function updatePageShare(id: string, input: ShareUpdateInput): Promise<PageMeta> {
+  const data = await request<{ page: PageMeta; pages: PageMeta[] }>(`/api/pages/${id}/share`, {
+    method: "POST",
+    json: input,
+  });
+  setPages(data.pages);
+  return data.page;
+}
+
+export async function fetchPublicShare(token: string, password?: string): Promise<PublicSharePayload> {
+  return request<PublicSharePayload>(`/api/public/share/${encodeURIComponent(token)}`, {
+    headers: password ? { "X-Share-Password": encodeURIComponent(password) } : undefined,
+  });
+}
+
+export async function verifyPublicSharePassword(token: string, password: string): Promise<void> {
+  await request(`/api/public/share/${encodeURIComponent(token)}/verify`, {
+    method: "POST",
+    json: { password },
+  });
+}
+
+export async function submitPublicShareForm(
+  token: string,
+  payload: { password?: string; title: string; props: Record<string, PropValue> },
+): Promise<PageMeta> {
+  const { row } = await request<{ row: PageMeta }>(`/api/public/share/${encodeURIComponent(token)}/submit`, {
+    method: "POST",
+    json: payload,
+  });
+  return row;
+}
+
+export async function fetchBackupConfig(): Promise<BackupConfigPublic> {
+  const { config } = await request<{ config: BackupConfigPublic }>("/api/backup/config");
+  return config;
+}
+
+export async function updateBackupConfig(patch: BackupConfigUpdate): Promise<BackupConfigPublic> {
+  const { config } = await request<{ config: BackupConfigPublic }>("/api/backup/config", {
+    method: "PUT",
+    json: patch,
+  });
+  return config;
+}
+
+export async function fetchBackupSnapshots(): Promise<BackupSnapshotItem[]> {
+  const { snapshots } = await request<{ snapshots: BackupSnapshotItem[] }>("/api/backup/snapshots");
+  return snapshots;
+}
+
+export async function deleteBackupSnapshot(filename: string): Promise<BackupSnapshotItem[]> {
+  const { snapshots } = await request<{ snapshots: BackupSnapshotItem[] }>(
+    `/api/backup/snapshots/${encodeURIComponent(filename)}`,
+    { method: "DELETE" },
+  );
+  return snapshots;
+}
+
+export async function runBackupNow(): Promise<{
+  snapshot: BackupSnapshotItem;
+  webdavUploaded: boolean;
+  config: BackupConfigPublic;
+  snapshots: BackupSnapshotItem[];
+}> {
+  return request("/api/backup/run-now", { method: "POST", json: {} });
+}
+
+export async function testWebDavConnection(override?: {
+  url?: string;
+  username?: string;
+  password?: string;
+}): Promise<{ ok: true; status: number }> {
+  return request("/api/backup/test-webdav", { method: "POST", json: override ?? {} });
+}
+
+export async function downloadEncryptedBackup(password: string): Promise<void> {
+  const res = await fetch("/api/backup/export-encrypted", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Client-Id": CLIENT_ID },
+    body: JSON.stringify({ password }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error((data as { error?: string }).error ?? "生成加密归档失败");
+  }
+  const blob = await res.blob();
+  const day = new Date().toISOString().slice(0, 10);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `OpenNotion-backup-${day}.opennotion.enc`;
+  a.click();
+  window.setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+}
+
+export async function decryptBackupArchive(file: Blob, password: string): Promise<Uint8Array> {
+  const res = await fetch("/api/backup/decrypt", {
+    method: "POST",
+    headers: {
+      "X-Upload": "1",
+      "X-Backup-Password": encodeURIComponent(password),
+      "Content-Type": "application/octet-stream",
+    },
+    body: file,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error((data as { error?: string }).error ?? "解密归档失败");
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+export async function fetchSnapshotZipBytes(filename: string, password?: string): Promise<Uint8Array> {
+  const res = await fetch(`/api/backup/snapshots/${encodeURIComponent(filename)}`, {
+    headers: password ? { "X-Backup-Password": encodeURIComponent(password) } : undefined,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error((data as { error?: string }).error ?? "读取本地快照失败");
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
 /* ---------- 持久化自动保存状态机（debouncing → saving → idle | error） ---------- */
 
 interface Pending {
@@ -512,15 +713,19 @@ winHooks.__openNotionFlush = flushAll;
 winHooks.__openNotionState = () => {
   const visiblePages = Object.values(state.pages).filter((p) => !p.trashed && !p.hidden);
   const tags = new Set(visiblePages.flatMap((p) => p.tags ?? []));
+  const publishedCount = visiblePages.filter((p) => p.share?.enabled).length;
   return {
     route: currentPageId(),
     bootStatus: state.loaded ? "ready" : "loading",
     topOverlay: topOverlayName(state.overlay),
     overlay: state.overlay,
+    splitPane: state.splitPane,
+    livePeers: state.livePeers,
     saveSummary: state.saveSummary,
     drag: getDragSnapshot(),
     pageCount: Object.keys(state.pages).length,
     visiblePageCount: visiblePages.length,
+    publishedCount,
     tagCount: tags.size,
   };
 };
@@ -625,6 +830,21 @@ export function setAiSettingsOpen(open: boolean) {
 
 export function setPeekRowId(id: string | null) {
   sendOverlay(id ? { type: "OPEN_PEEK", rowId: id } : { type: "CLOSE_PEEK" });
+}
+
+export function openSplitPane(pageId: string) {
+  const next = transitionSplitPane(state.splitPane, { type: "OPEN", pageId });
+  if (next !== state.splitPane) set({ splitPane: next });
+}
+
+export function closeSplitPane() {
+  const next = transitionSplitPane(state.splitPane, { type: "CLOSE" });
+  if (next !== state.splitPane) set({ splitPane: next });
+}
+
+export function resizeSplitPane(ratio: number) {
+  const next = transitionSplitPane(state.splitPane, { type: "RESIZE", ratio });
+  if (next !== state.splitPane) set({ splitPane: next });
 }
 
 const systemDark = window.matchMedia("(prefers-color-scheme: dark)");

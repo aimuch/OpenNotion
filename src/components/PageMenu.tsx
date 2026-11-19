@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   ALargeSmall,
   Clock,
+  Columns2,
   Copy,
   Download,
   FileCode2,
@@ -25,6 +26,7 @@ import {
   getState,
   isDescendant,
   navigate,
+  openSplitPane,
   trashPage,
   updatePage,
 } from "../store";
@@ -131,6 +133,11 @@ export function PageMenu({
           const id = await duplicatePage(page.id);
           if (id) navigate(id);
         })}
+      />
+      <MenuItem
+        icon={<Columns2 size={16} />}
+        label="在右侧分屏打开"
+        onClick={run(() => openSplitPane(page.id))}
       />
       <MenuItem
         icon={<Link2 size={16} />}

@@ -73,13 +73,15 @@ async function copyWorkspaceIfEmpty(fromDir: string, toDir: string) {
       await fs.cp(src, path.join(toDir, sub), { recursive: true, force: false, errorOnExist: false });
     }
   }
-  const aiSrc = path.join(fromDir, "ai.json");
-  const aiDst = path.join(toDir, "ai.json");
-  const hasDstAi = await fs.stat(aiDst).catch(() => null);
-  const hasSrcAi = await fs.stat(aiSrc).catch(() => null);
-  if (hasSrcAi && !hasDstAi) {
-    await fs.copyFile(aiSrc, aiDst);
-    await fs.chmod(aiDst, 0o600).catch(() => {});
+  for (const cfgName of ["ai.json", "mcp.json", "backup-config.json"]) {
+    const src = path.join(fromDir, cfgName);
+    const dst = path.join(toDir, cfgName);
+    const hasDst = await fs.stat(dst).catch(() => null);
+    const hasSrc = await fs.stat(src).catch(() => null);
+    if (hasSrc && !hasDst) {
+      await fs.copyFile(src, dst);
+      await fs.chmod(dst, 0o600).catch(() => {});
+    }
   }
 }
 
@@ -162,13 +164,14 @@ function startServer(): Promise<number> {
       res.writeHead(403).end();
       return;
     }
+    const { pathname } = new URL(req.url ?? "/", "http://localhost");
+    // 浏览器书签栏剪藏（/api/clip）与跨域 MCP 请求（/api/mcp）交由 api 中间件强制校验 Bearer Token 口令
+    const allowBearerCors = pathname === "/api/clip" || pathname === "/api/mcp";
     const reqOrigin = req.headers.origin;
-    if (reqOrigin && new URL(reqOrigin).host !== req.headers.host) {
+    if (reqOrigin && new URL(reqOrigin).host !== req.headers.host && !allowBearerCors) {
       res.writeHead(403).end();
       return;
     }
-
-    const { pathname } = new URL(req.url ?? "/", "http://localhost");
     if (pathname === "/api/storage" && req.method === "GET") {
       void api.sync().then(
         () =>

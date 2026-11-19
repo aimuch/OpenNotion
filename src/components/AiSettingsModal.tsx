@@ -13,6 +13,7 @@ import {
   Import,
   KeyRound,
   LoaderCircle,
+  Lock,
   Monitor,
   Moon,
   Palette,
@@ -22,6 +23,8 @@ import {
   RotateCcw,
   Search,
   SearchX,
+  Server,
+  ShieldCheck,
   Sparkles,
   Sun,
   Trash,
@@ -36,27 +39,42 @@ import type {
   AiProviderPublic,
   AiProviderUpdate,
   AiRegion,
+  BackupConfigPublic,
+  BackupSnapshotItem,
   McpConfigPublic,
   StorageInfo,
 } from "../../shared/types";
 import { fetchRemoteModels, loadAiConfig, saveAiConfig, testAiProvider } from "../ai";
 import { shortId } from "../db";
-import type { SettingsTab } from "../machines";
+import {
+  INITIAL_SETTINGS_ASYNC_STATE,
+  transitionConfirmAction,
+  transitionSettingsAsync,
+  useMachine,
+  type SettingsTab,
+} from "../machines";
 import {
   cleanOrphanSynced,
+  deleteBackupSnapshot,
   deletePage,
   desktopImportFolder,
   desktopOpenDataDir,
   desktopPickDataDir,
   desktopResetDataDir,
+  downloadEncryptedBackup,
   emptyTrash,
+  fetchBackupConfig,
+  fetchBackupSnapshots,
   fetchMcpConfig,
   fetchStorageInfo,
   navigate,
   openSettings,
   restorePage,
+  runBackupNow,
   setTheme,
   syncFromDisk,
+  testWebDavConnection,
+  updateBackupConfig,
   updateMcpConfig,
   useStore,
   useTree,
@@ -296,9 +314,22 @@ function SyncAndDataPane({
   onClose: () => void;
 }) {
   const [storage, setStorage] = useState<StorageInfo | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [backupCfg, setBackupCfg] = useState<BackupConfigPublic | null>(null);
+  const [snapshots, setSnapshots] = useState<BackupSnapshotItem[]>([]);
+  const [exportPwd, setExportPwd] = useState("");
+  const [autoEncPwd, setAutoEncPwd] = useState("");
+  const [davUrl, setDavUrl] = useState("");
+  const [davUser, setDavUser] = useState("");
+  const [davPwd, setDavPwd] = useState("");
+  const [davDir, setDavDir] = useState("OpenNotion-Backups");
+  const [davEnabled, setDavEnabled] = useState(false);
+  const [autoEnabled, setAutoEnabled] = useState(false);
+  const [intervalHours, setIntervalHours] = useState(24);
+  const [keepCount, setKeepCount] = useState(10);
   const [copied, setCopied] = useState(false);
-  const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
+  const [asyncState, sendAsync] = useMachine(transitionSettingsAsync, INITIAL_SETTINGS_ASYNC_STATE);
+  const busy = asyncState.phase === "busy";
+  const notice = asyncState.notice;
 
   useEffect(() => {
     let alive = true;
@@ -306,68 +337,120 @@ function SyncAndDataPane({
       (info) => alive && setStorage(info),
       () => {},
     );
+    fetchBackupConfig().then(
+      (cfg) => {
+        if (!alive) return;
+        setBackupCfg(cfg);
+        setAutoEnabled(cfg.autoEnabled);
+        setIntervalHours(cfg.intervalHours);
+        setKeepCount(cfg.keepCount);
+        setDavEnabled(cfg.webdav.enabled);
+        setDavUrl(cfg.webdav.url);
+        setDavUser(cfg.webdav.username);
+        setDavDir(cfg.webdav.remoteDir || "OpenNotion-Backups");
+      },
+      () => {},
+    );
+    fetchBackupSnapshots().then(
+      (list) => alive && setSnapshots(list),
+      () => {},
+    );
     return () => {
       alive = false;
     };
   }, []);
 
-  const handleManualSync = async () => {
-    setBusy(true);
-    setNotice(null);
+  const runJob = async (job: string, fn: () => Promise<string | void>) => {
+    if (busy) return;
+    sendAsync({ type: "BEGIN", job });
     try {
+      const msg = await fn();
+      sendAsync({ type: "SUCCEED", text: msg || undefined });
+    } catch (err) {
+      sendAsync({ type: "FAIL", text: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  const handleManualSync = () =>
+    runJob("sync", async () => {
       const diff = await syncFromDisk();
       const count = diff.updatedIds.length + diff.removedIds.length;
-      setNotice({
-        ok: true,
-        text: count > 0 ? `已从磁盘同步 ${count} 处外部文件变更` : "当前已是磁盘最新内容，无需更新",
-      });
-    } catch (err) {
-      setNotice({ ok: false, text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setBusy(false);
-    }
-  };
+      return count > 0 ? `已从磁盘同步 ${count} 处外部文件变更` : "当前已是磁盘最新内容，无需更新";
+    });
 
-  const handlePickSyncDir = async () => {
-    setBusy(true);
-    setNotice(null);
-    try {
+  const handlePickSyncDir = () =>
+    runJob("pick-dir", async () => {
       const res = await desktopPickDataDir();
       setStorage(res.storage);
-      if (res.changed) {
-        setNotice({ ok: true, text: `数据目录已切换至：${res.storage.dataDir}` });
-      }
-    } catch (err) {
-      setNotice({ ok: false, text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setBusy(false);
-    }
-  };
+      return res.changed ? `数据目录已切换至：${res.storage.dataDir}` : undefined;
+    });
 
-  const handleResetDir = async () => {
-    setBusy(true);
-    setNotice(null);
-    try {
+  const handleResetDir = () =>
+    runJob("reset-dir", async () => {
       const res = await desktopResetDataDir();
       setStorage(res.storage);
-      setNotice({ ok: true, text: "已切回本机默认存储目录" });
-    } catch (err) {
-      setNotice({ ok: false, text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setBusy(false);
-    }
-  };
+      return "已切回本机默认存储目录";
+    });
 
-  const handleCleanSynced = async () => {
-    const n = await cleanOrphanSynced();
-    setNotice({ ok: true, text: n > 0 ? `已清理 ${n} 个未引用的闲置同步块` : "没有需要清理的闲置同步块" });
-  };
+  const handleCleanSynced = () =>
+    runJob("clean-synced", async () => {
+      const n = await cleanOrphanSynced();
+      return n > 0 ? `已清理 ${n} 个未引用的闲置同步块` : "没有需要清理的闲置同步块";
+    });
+
+  const handleSaveBackupConfig = () =>
+    runJob("save-backup", async () => {
+      const saved = await updateBackupConfig({
+        autoEnabled,
+        intervalHours,
+        keepCount,
+        ...(autoEncPwd.trim() ? { encryptPassword: autoEncPwd.trim() } : {}),
+        webdav: {
+          enabled: davEnabled,
+          url: davUrl.trim(),
+          username: davUser.trim(),
+          ...(davPwd ? { password: davPwd } : {}),
+          remoteDir: davDir.trim() || "OpenNotion-Backups",
+        },
+      });
+      setBackupCfg(saved);
+      setAutoEncPwd("");
+      setDavPwd("");
+      return "定时备份与 WebDAV 设置已保存";
+    });
+
+  const handleTestWebDav = () =>
+    runJob("test-webdav", async () => {
+      const res = await testWebDavConnection({
+        url: davUrl.trim(),
+        username: davUser.trim(),
+        ...(davPwd ? { password: davPwd } : {}),
+      });
+      return `WebDAV 连接正常（HTTP ${res.status}）`;
+    });
+
+  const handleRunBackupNow = () =>
+    runJob("run-backup", async () => {
+      const res = await runBackupNow();
+      setBackupCfg(res.config);
+      setSnapshots(res.snapshots);
+      return res.webdavUploaded
+        ? `备份成功：${res.snapshot.filename}（已同步上传至 WebDAV）`
+        : `本地快照已生成：${res.snapshot.filename}`;
+    });
+
+  const handleExportEncrypted = () =>
+    runJob("export-enc", async () => {
+      await downloadEncryptedBackup(exportPwd.trim());
+      setExportPwd("");
+      return "已生成并下载 AES-256-GCM 加密备份归档";
+    });
 
   return (
-    <div className="settings-pane">
+    <div className="settings-pane" data-settings-async-state={asyncState.phase}>
       <PaneHeader
         title="数据与多端同步"
-        subtitle="所有页面均以独立的 JSON 文件保存在本地，支持放入 iCloud Drive 或 NAS 同步目录实现多台电脑同步。"
+        subtitle="支持 iCloud / NAS 目录同步、AES-256 加密备份、定时快照与 WebDAV 异地副本。"
         onClose={onClose}
       />
       <div className="settings-pane-body">
@@ -410,7 +493,7 @@ function SyncAndDataPane({
                 </>
               ) : (
                 <button type="button" className="ghost-btn small" disabled={busy} onClick={() => void handleManualSync()}>
-                  {busy ? <LoaderCircle size={13} className="spin" /> : <RefreshCw size={13} />} 立即扫描磁盘变更
+                  {busy && asyncState.job === "sync" ? <LoaderCircle size={13} className="spin" /> : <RefreshCw size={13} />} 立即扫描磁盘变更
                 </button>
               )}
             </div>
@@ -418,25 +501,51 @@ function SyncAndDataPane({
           <p className="settings-help">
             <strong>多台电脑同步方式：</strong>在桌面版点击上方“选择同步文件夹”，将目录指定到 <code>iCloud Drive</code>、群晖{" "}
             <code>Synology Drive</code>、<code>SMB/NAS</code> 挂载盘、<code>OneDrive</code> 或 <code>坚果云</code>{" "}
-            中的同一个文件夹即可；网页开发模式可通过环境变量 <code>OPEN_NOTION_DATA=/同步目录路径 npm run dev</code> 指定。切换回窗口时会自动感知外部文件更新。
+            中的同一个文件夹即可；网页开发模式可通过环境变量 <code>OPEN_NOTION_DATA=/同步目录路径 npm run dev</code> 指定。
           </p>
         </section>
 
         <section className="settings-section">
-          <h3>备份、导入与维护</h3>
+          <h3>备份、加密归档与第三方导入</h3>
           <div className="settings-card-row">
             <div>
-              <strong>导出全量工作区备份（.zip）</strong>
-              <p>生成双轨压缩包：解压后 notes/ 目录保留纯文本 Markdown 树与附件供自由阅读，同时附带结构化元数据支持 100% 无损还原。</p>
+              <strong>导出双轨全量备份（.zip）</strong>
+              <p>解压后 notes/ 目录保留纯文本 Markdown 树与附件供自由阅读，同时附带结构化元数据支持 100% 无损还原。</p>
             </div>
             <a className="ghost-btn small" href="/api/backup/export" download>
-              <Download size={14} /> 导出备份 .zip
+              <Download size={14} /> 导出 .zip
             </a>
           </div>
+
+          <div className="settings-card-row">
+            <div style={{ flex: 1 }}>
+              <strong>
+                <Lock size={13} /> 导出 AES-256 加密归档（.opennotion.enc）
+              </strong>
+              <p>使用口令对全量备份进行 AES-256-GCM 认证加密，适合安全上传网盘或异地归档。</p>
+              <div className="share-link-row" style={{ marginTop: 8, maxWidth: 380 }}>
+                <input
+                  type="password"
+                  value={exportPwd}
+                  placeholder="设置归档加密口令…"
+                  onChange={(e) => setExportPwd(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="ghost-btn small"
+                  disabled={busy || !exportPwd.trim()}
+                  onClick={() => void handleExportEncrypted()}
+                >
+                  <ShieldCheck size={13} /> 加密导出
+                </button>
+              </div>
+            </div>
+          </div>
+
           <div className="settings-card-row">
             <div>
-              <strong>导入备份 / Obsidian / Notion 导出包</strong>
-              <p>支持无损恢复 OpenNotion 备份包，或直接导入 Obsidian / Markdown 笔记库（自动转换双链与标签）及 Notion 导出包。</p>
+              <strong>导入备份 / Obsidian / 印象笔记 / Notion</strong>
+              <p>支持无损恢复 .zip / .opennotion.enc 加密备份，或导入 Obsidian 双链库、印象笔记（.enex）与 Notion 导出包。</p>
             </div>
             <button
               type="button"
@@ -446,7 +555,7 @@ function SyncAndDataPane({
                 onImportNotionZip?.();
               }}
             >
-              <Import size={14} /> 选择 .zip 导入…
+              <Import size={14} /> 选择文件导入…
             </button>
           </div>
           {hasHiddenSynced && (
@@ -455,11 +564,150 @@ function SyncAndDataPane({
                 <strong>清理闲置同步块</strong>
                 <p>移除已经没有任何页面引用的孤立同步块数据。</p>
               </div>
-              <button type="button" className="ghost-btn small" onClick={() => void handleCleanSynced()}>
+              <button type="button" className="ghost-btn small" disabled={busy} onClick={() => void handleCleanSynced()}>
                 <RefreshCw size={13} /> 立即清理
               </button>
             </div>
           )}
+        </section>
+
+        <section className="settings-section">
+          <h3>
+            <Server size={14} /> 定时自动备份与 WebDAV 异地副本
+          </h3>
+          <div className="backup-config-box">
+            <div className="backup-config-grid">
+              <label className="poster-check">
+                <input
+                  type="checkbox"
+                  checked={autoEnabled}
+                  onChange={(e) => setAutoEnabled(e.target.checked)}
+                />
+                <span>开启定时自动本地备份</span>
+              </label>
+              <label className="backup-field">
+                <span>备份周期</span>
+                <select value={intervalHours} onChange={(e) => setIntervalHours(Number(e.target.value))}>
+                  <option value={24}>每天一次</option>
+                  <option value={168}>每周一次</option>
+                </select>
+              </label>
+              <label className="backup-field">
+                <span>最多保留快照</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={keepCount}
+                  onChange={(e) => setKeepCount(Math.max(1, Number(e.target.value) || 10))}
+                />
+              </label>
+              <label className="backup-field">
+                <span>自动备份加密口令 {backupCfg?.hasEncryptPassword ? "（已设置）" : "（留空不加密）"}</span>
+                <input
+                  type="password"
+                  value={autoEncPwd}
+                  placeholder={backupCfg?.hasEncryptPassword ? "留空保持原口令…" : "可选：启用自动加密…"}
+                  onChange={(e) => setAutoEncPwd(e.target.value)}
+                />
+              </label>
+            </div>
+
+            <div className="backup-webdav-block">
+              <label className="poster-check">
+                <input
+                  type="checkbox"
+                  checked={davEnabled}
+                  onChange={(e) => setDavEnabled(e.target.checked)}
+                />
+                <span>同步上传备份至 WebDAV（群晖 NAS / 坚果云 / Nextcloud / Alist）</span>
+              </label>
+              {davEnabled && (
+                <div className="backup-config-grid" style={{ marginTop: 8 }}>
+                  <label className="backup-field">
+                    <span>WebDAV 地址</span>
+                    <input
+                      value={davUrl}
+                      placeholder="https://dav.jianguoyun.com/dav/"
+                      onChange={(e) => setDavUrl(e.target.value)}
+                    />
+                  </label>
+                  <label className="backup-field">
+                    <span>远端目录</span>
+                    <input
+                      value={davDir}
+                      placeholder="OpenNotion-Backups"
+                      onChange={(e) => setDavDir(e.target.value)}
+                    />
+                  </label>
+                  <label className="backup-field">
+                    <span>用户名 / 邮箱</span>
+                    <input value={davUser} placeholder="账号" onChange={(e) => setDavUser(e.target.value)} />
+                  </label>
+                  <label className="backup-field">
+                    <span>应用密码 {backupCfg?.webdav.hasPassword ? "（已保存）" : ""}</span>
+                    <input
+                      type="password"
+                      value={davPwd}
+                      placeholder={backupCfg?.webdav.hasPassword ? "留空保持原密码…" : "输入 WebDAV 应用密码"}
+                      onChange={(e) => setDavPwd(e.target.value)}
+                    />
+                  </label>
+                </div>
+              )}
+            </div>
+
+            <div className="storage-actions" style={{ marginTop: 10 }}>
+              <button type="button" className="primary-btn small" disabled={busy} onClick={() => void handleSaveBackupConfig()}>
+                保存备份设置
+              </button>
+              {davEnabled && (
+                <button type="button" className="ghost-btn small" disabled={busy || !davUrl.trim()} onClick={() => void handleTestWebDav()}>
+                  测试 WebDAV 连接
+                </button>
+              )}
+              <button type="button" className="ghost-btn small" disabled={busy} onClick={() => void handleRunBackupNow()}>
+                {busy && asyncState.job === "run-backup" ? <LoaderCircle size={13} className="spin" /> : <Download size={13} />} 立即备份一次
+              </button>
+            </div>
+
+            {backupCfg?.lastStatus && (
+              <div className="settings-help" style={{ marginTop: 6 }}>
+                最近状态：{backupCfg.lastStatus}
+                {backupCfg.lastBackupAt
+                  ? `（${new Date(backupCfg.lastBackupAt).toLocaleString("zh-CN")}）`
+                  : ""}
+              </div>
+            )}
+
+            {snapshots.length > 0 && (
+              <div className="backup-snapshot-list">
+                {snapshots.slice(0, 8).map((snap) => (
+                  <div key={snap.filename} className="backup-snapshot-row">
+                    <span>
+                      {snap.encrypted ? "🔒 " : "📦 "}
+                      <code>{snap.filename}</code> · {(snap.size / 1024).toFixed(1)} KB
+                    </span>
+                    <button
+                      type="button"
+                      className="icon-btn small"
+                      title="删除此本地快照"
+                      aria-label={`删除快照 ${snap.filename}`}
+                      disabled={busy}
+                      onClick={() =>
+                        void runJob("del-snap", async () => {
+                          setSnapshots(await deleteBackupSnapshot(snap.filename));
+                          return `已删除本地快照 ${snap.filename}`;
+                        })
+                      }
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </section>
 
         {notice && (
@@ -643,11 +891,23 @@ function McpSettingsPane({ onClose }: { onClose: () => void }) {
 
 function TrashPane({ items, onClose }: { items: ReturnType<typeof useTree>["trash"]; onClose: () => void }) {
   const [query, setQuery] = useState("");
+  const [confirmState, sendConfirm] = useMachine(transitionConfirmAction, { status: "idle" });
   const q = query.trim().toLowerCase();
   const shown = q ? items.filter((p) => (p.title || "无标题").toLowerCase().includes(q)) : items;
 
+  const confirmEmpty = confirmState.status === "confirming" && confirmState.targetKey === "__empty__";
+
+  const executeConfirm = async (targetKey: string, action: () => Promise<unknown>) => {
+    sendConfirm({ type: "EXECUTE", targetKey });
+    try {
+      await action();
+    } finally {
+      sendConfirm({ type: "DONE" });
+    }
+  };
+
   return (
-    <div className="settings-pane">
+    <div className="settings-pane" data-confirm-state={confirmState.status}>
       <PaneHeader title="回收站" subtitle="已删除的页面会暂存在这里，可随时恢复或彻底清除。" onClose={onClose} />
       <div className="settings-pane-body">
         <div className="settings-trash-bar">
@@ -660,69 +920,105 @@ function TrashPane({ items, onClose }: { items: ReturnType<typeof useTree>["tras
               onChange={(e) => setQuery(e.target.value)}
             />
           </label>
-          {items.length > 0 && (
-            <button
-              type="button"
-              className="ghost-btn small danger-text"
-              onClick={() => {
-                if (window.confirm(`永久删除回收站中的全部 ${items.length} 个页面？此操作无法撤销。`)) {
-                  void emptyTrash();
-                }
-              }}
-            >
-              <Eraser size={14} /> 清空回收站
-            </button>
-          )}
+          {items.length > 0 &&
+            (confirmEmpty ? (
+              <div className="inline-confirm-group">
+                <button
+                  type="button"
+                  className="primary-btn small danger"
+                  onClick={() => void executeConfirm("__empty__", emptyTrash)}
+                >
+                  确认清空（{items.length}）
+                </button>
+                <button
+                  type="button"
+                  className="text-btn small"
+                  onClick={() => sendConfirm({ type: "CANCEL" })}
+                >
+                  取消
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="ghost-btn small danger-text"
+                onClick={() => sendConfirm({ type: "REQUEST", targetKey: "__empty__" })}
+              >
+                <Eraser size={14} /> 清空回收站
+              </button>
+            ))}
         </div>
 
         <div className="settings-trash-list">
-          {shown.map((p) => (
-            <div
-              key={p.id}
-              className="trash-row"
-              role="button"
-              tabIndex={0}
-              onClick={() => {
-                navigate(p.id);
-                onClose();
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && e.target === e.currentTarget) {
+          {shown.map((p) => {
+            const confirmingRow = confirmState.status === "confirming" && confirmState.targetKey === p.id;
+            return (
+              <div
+                key={p.id}
+                className="trash-row"
+                role="button"
+                tabIndex={0}
+                onClick={() => {
                   navigate(p.id);
                   onClose();
-                }
-              }}
-            >
-              <span className="tree-icon">{p.icon ?? <FileText size={16} />}</span>
-              <span className="trash-title">{p.title || "无标题"}</span>
-              <button
-                type="button"
-                className="ghost-btn small"
-                title="恢复页面"
-                aria-label={`恢复“${p.title || "无标题"}”`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void restorePage(p.id);
                 }}
-              >
-                <Undo2 size={13} /> 恢复
-              </button>
-              <button
-                type="button"
-                className="icon-btn small"
-                title="永久删除"
-                aria-label={`永久删除“${p.title || "无标题"}”`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (window.confirm(`永久删除“${p.title || "无标题"}”及其子页面？此操作无法撤销。`)) {
-                    void deletePage(p.id);
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && e.target === e.currentTarget) {
+                    navigate(p.id);
+                    onClose();
                   }
                 }}
               >
-                <Trash2 size={14} />
-              </button>
-            </div>
-          ))}
+                <span className="tree-icon">{p.icon ?? <FileText size={16} />}</span>
+                <span className="trash-title">{p.title || "无标题"}</span>
+                {confirmingRow ? (
+                  <div className="inline-confirm-group" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      type="button"
+                      className="primary-btn small danger"
+                      onClick={() => void executeConfirm(p.id, () => deletePage(p.id))}
+                    >
+                      确认永久删除
+                    </button>
+                    <button
+                      type="button"
+                      className="text-btn small"
+                      onClick={() => sendConfirm({ type: "CANCEL" })}
+                    >
+                      取消
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="ghost-btn small"
+                      title="恢复页面"
+                      aria-label={`恢复“${p.title || "无标题"}”`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void restorePage(p.id);
+                      }}
+                    >
+                      <Undo2 size={13} /> 恢复
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn small"
+                      title="永久删除"
+                      aria-label={`永久删除“${p.title || "无标题"}”`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        sendConfirm({ type: "REQUEST", targetKey: p.id });
+                      }}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </>
+                )}
+              </div>
+            );
+          })}
           {shown.length === 0 && (
             <div className="trash-empty">
               {items.length === 0 ? <Trash size={28} strokeWidth={1.5} /> : <SearchX size={28} strokeWidth={1.5} />}
@@ -744,10 +1040,12 @@ function AiProvidersPane({ onClose }: { onClose: () => void }) {
   const [customSystemPrompt, setCustomSystemPrompt] = useState<string>("");
   const [showKey, setShowKey] = useState(false);
   const [newModel, setNewModel] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [fetchingModels, setFetchingModels] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [asyncState, sendAsync] = useMachine(transitionSettingsAsync, INITIAL_SETTINGS_ASYNC_STATE);
+  const saving = asyncState.phase === "busy" && asyncState.job === "save";
+  const fetchingModels = asyncState.phase === "busy" && asyncState.job === "models";
+  const testing = asyncState.phase === "busy" && asyncState.job === "test";
+  const anyBusy = asyncState.phase === "busy";
+  const status = asyncState.notice;
 
   useEffect(() => {
     let alive = true;
@@ -761,19 +1059,19 @@ function AiProvidersPane({ onClose }: { onClose: () => void }) {
         setTemperature(cfg.temperature);
         setCustomSystemPrompt(cfg.customSystemPrompt);
       },
-      (err: Error) => alive && setStatus({ ok: false, text: err.message }),
+      (err: Error) => alive && sendAsync({ type: "FAIL", text: err.message }),
     );
     return () => {
       alive = false;
     };
-  }, []);
+  }, [sendAsync]);
 
   const current = drafts.find((d) => d.id === selectedId) ?? drafts[0];
 
   const patchCurrent = (change: Partial<DraftProvider>) => {
     if (!current) return;
     setDrafts((prev) => prev.map((d) => (d.id === current.id ? { ...d, ...change } : d)));
-    setStatus(null);
+    sendAsync({ type: "CLEAR_NOTICE" });
   };
 
   const addCustomProvider = () => {
@@ -795,7 +1093,7 @@ function AiProvidersPane({ onClose }: { onClose: () => void }) {
     };
     setDrafts((prev) => [...prev, created]);
     setSelectedId(id);
-    setStatus(null);
+    sendAsync({ type: "CLEAR_NOTICE" });
   };
 
   const removeCustomProvider = () => {
@@ -824,9 +1122,8 @@ function AiProvidersPane({ onClose }: { onClose: () => void }) {
   };
 
   const pullModels = async () => {
-    if (!current) return;
-    setFetchingModels(true);
-    setStatus(null);
+    if (!current || anyBusy) return;
+    sendAsync({ type: "BEGIN", job: "models" });
     try {
       const remote = await fetchRemoteModels({
         providerId: current.builtin ? current.id : undefined,
@@ -836,24 +1133,21 @@ function AiProvidersPane({ onClose }: { onClose: () => void }) {
         headers: textToHeaders(current.headersText),
       });
       if (remote.length === 0) {
-        setStatus({ ok: false, text: "接口未返回可用模型列表，可手动输入模型名称添加。" });
+        sendAsync({ type: "FAIL", text: "接口未返回可用模型列表，可手动输入模型名称添加。" });
       } else {
         const merged = [...new Set([...current.models, ...remote.slice(0, 60)])];
-        patchCurrent({ models: merged });
+        setDrafts((prev) => prev.map((d) => (d.id === current.id ? { ...d, models: merged } : d)));
         if (!activeModel || activeProviderId === current.id) setActiveModel(remote[0]);
-        setStatus({ ok: true, text: `已从接口同步 ${remote.length} 个模型` });
+        sendAsync({ type: "SUCCEED", text: `已从接口同步 ${remote.length} 个模型` });
       }
     } catch (err) {
-      setStatus({ ok: false, text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setFetchingModels(false);
+      sendAsync({ type: "FAIL", text: err instanceof Error ? err.message : String(err) });
     }
   };
 
   const runTest = async () => {
-    if (!current) return;
-    setTesting(true);
-    setStatus(null);
+    if (!current || anyBusy) return;
+    sendAsync({ type: "BEGIN", job: "test" });
     try {
       const modelToTest =
         activeProviderId === current.id && activeModel ? activeModel : (current.models[0] ?? newModel.trim());
@@ -872,17 +1166,15 @@ function AiProvidersPane({ onClose }: { onClose: () => void }) {
         baseUrl: current.baseUrl,
         headers: textToHeaders(current.headersText),
       });
-      setStatus({ ok: true, text: `连接正常（${res.ms} ms · ${res.model}）：${res.reply}` });
+      sendAsync({ type: "SUCCEED", text: `连接正常（${res.ms} ms · ${res.model}）：${res.reply}` });
     } catch (err) {
-      setStatus({ ok: false, text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setTesting(false);
+      sendAsync({ type: "FAIL", text: err instanceof Error ? err.message : String(err) });
     }
   };
 
   const saveAndClose = async () => {
-    setSaving(true);
-    setStatus(null);
+    if (anyBusy) return;
+    sendAsync({ type: "BEGIN", job: "save" });
     try {
       await saveAiConfig({
         providers: toUpdates(drafts),
@@ -891,11 +1183,10 @@ function AiProvidersPane({ onClose }: { onClose: () => void }) {
         temperature,
         customSystemPrompt,
       });
+      sendAsync({ type: "SUCCEED" });
       onClose();
     } catch (err) {
-      setStatus({ ok: false, text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setSaving(false);
+      sendAsync({ type: "FAIL", text: err instanceof Error ? err.message : String(err) });
     }
   };
 
@@ -918,7 +1209,7 @@ function AiProvidersPane({ onClose }: { onClose: () => void }) {
                       className={cx("ai-provider-item", p.id === current?.id && "active")}
                       onClick={() => {
                         setSelectedId(p.id);
-                        setStatus(null);
+                        sendAsync({ type: "CLEAR_NOTICE" });
                       }}
                     >
                       <span className={cx("ai-dot", configured && "ready")} />
